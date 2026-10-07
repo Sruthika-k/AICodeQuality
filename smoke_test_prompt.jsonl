@@ -1,0 +1,1 @@
+{"id": "smoke1", "prompt": "Write a Python function called count_vowels(text) that returns the number of vowels (a, e, i, o, u) in the given string. Treat uppercase and lowercase vowels the same."}
