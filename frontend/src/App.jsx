@@ -1,5 +1,13 @@
-import React, { useState } from "react";
-import Charts from "./Charts";
+import React, { useEffect, useRef, useState } from "react";
+import Header from "./components/Header";
+import Pipeline from "./components/Pipeline";
+import AnalysisTools from "./components/AnalysisTools";
+import EmptyState from "./components/EmptyState";
+import ResultsView from "./components/ResultsView";
+import recordedRun01 from "./demo/recorded_run_01.json";
+import { RECORDING_LOAD_ERROR, validateRecording } from "./demo/validateRecording";
+import { recordingToUiResult, sliceResultThroughIteration } from "./demo/recordingToResult";
+import { createPlayback } from "./demo/playbackEngine";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
@@ -21,18 +29,83 @@ const SAMPLE_PROMPTS = [
   },
 ];
 
+function enrichLiveResult(data) {
+  const iterations = (data.iterations || []).map((it, idx) => ({
+    ...it,
+    accepted: it.accepted ?? (idx === 0 ? true : Boolean(it.threshold_met)),
+    acceptance_reason:
+      it.acceptance_reason ??
+      (idx === 0 ? "ACCEPTED_INITIAL" : it.threshold_met ? "Converged" : "Improved metrics"),
+    issues_eliminated: it.issues_eliminated ?? null,
+    issues_introduced: it.issues_introduced ?? null,
+  }));
+  const last = iterations[iterations.length - 1];
+  return {
+    ...data,
+    iterations,
+    original_code: data.original_code || iterations[0]?.code || "",
+    unified_diff: data.unified_diff || last?.diff || null,
+    issue_evolution: data.issue_evolution || { resolved: null, introduced: null, persistent: null },
+    decision: data.decision || (last?.accepted ? "accepted" : data.converged ? "accepted" : "rejected"),
+    decision_reason: data.decision_reason || last?.acceptance_reason || null,
+  };
+}
+
 export default function App() {
   const [prompt, setPrompt] = useState(SAMPLE_PROMPTS[0].prompt);
   const [code, setCode] = useState("");
-  const [mode, setMode] = useState("generate"); // "generate" or "review"
+  const [mode, setMode] = useState("generate");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
-  const [activeTab, setActiveTab] = useState(0); // for iteration tabs
   const [copied, setCopied] = useState(false);
-  const [diffMode, setDiffMode] = useState("side-by-side"); // "side-by-side" or "unified"
+  const [diffMode, setDiffMode] = useState("side-by-side");
   const [iterationCap, setIterationCap] = useState(3);
   const [pylintThreshold, setPylintThreshold] = useState(8.0);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [pipelineActive, setPipelineActive] = useState(null);
+  const [pipelineCompleted, setPipelineCompleted] = useState([]);
+  const [activeTool, setActiveTool] = useState(null);
+  const [playbackLlmCalls, setPlaybackLlmCalls] = useState(0);
+  const [liveApiCalls, setLiveApiCalls] = useState(0);
+  const [recording, setRecording] = useState(null);
+  const [playing, setPlaying] = useState(false);
+
+  const playbackRef = useRef(null);
+
+  const stopPlayback = () => {
+    playbackRef.current?.stop();
+    playbackRef.current = null;
+    setPlaying(false);
+  };
+
+  useEffect(() => {
+    return () => stopPlayback();
+  }, []);
+
+  useEffect(() => {
+    if (mode !== "demo") {
+      stopPlayback();
+      setPipelineActive(null);
+      setPipelineCompleted([]);
+      setActiveTool(null);
+      setRecording(null);
+      return;
+    }
+    const check = validateRecording(recordedRun01);
+    if (!check.ok) {
+      setError(RECORDING_LOAD_ERROR);
+      setRecording(null);
+      return;
+    }
+    setError(null);
+    setRecording(recordedRun01);
+    setPrompt(recordedRun01.input?.prompt || "");
+    setCode(recordedRun01.input?.original_code || "");
+    setResult(null);
+    setPipelineActive(null);
+    setPipelineCompleted([]);
+  }, [mode]);
 
   const handleFileUpload = (e) => {
     const file = e.target.files[0];
@@ -49,7 +122,58 @@ export default function App() {
     }
   };
 
+  const startDemoPlayback = (skip = false) => {
+    if (mode !== "demo") return;
+    const check = validateRecording(recordedRun01);
+    if (!check.ok) {
+      setError(RECORDING_LOAD_ERROR);
+      return;
+    }
+    const full = recordingToUiResult(recordedRun01);
+    setRecording(recordedRun01);
+    setError(null);
+    setResult(null);
+    setPlaybackLlmCalls(0);
+    setPipelineActive("input");
+    setPipelineCompleted([]);
+    setActiveTool(null);
+
+    stopPlayback();
+    const controller = createPlayback({
+      timingEvents: recordedRun01.timing_events,
+      speed: playbackSpeed,
+      iterationCount: full.iterations.length,
+      onStage: ({ active, completed }) => {
+        setPipelineActive(active);
+        setPipelineCompleted(completed);
+        setPlaying(true);
+      },
+      onTool: (tool) => setActiveTool(tool),
+      onVisibleIterations: (count) => {
+        setResult(sliceResultThroughIteration(full, count));
+      },
+      onComplete: () => {
+        setResult(full);
+        setPlaying(false);
+        setActiveTool(null);
+        setPipelineActive("best");
+        setPipelineCompleted(["input", "gemini", "analysis", "feedback", "refinement", "regression", "acceptance", "best"]);
+      },
+    });
+    playbackRef.current = controller;
+    if (skip) {
+      controller.skip();
+    } else {
+      setPlaying(true);
+      controller.start();
+    }
+  };
+
   const handleRun = async () => {
+    if (mode === "demo") {
+      startDemoPlayback(false);
+      return;
+    }
     if (mode === "generate" && !prompt.trim()) return;
     if (mode === "review" && !code.trim()) return;
 
@@ -59,23 +183,25 @@ export default function App() {
 
     try {
       const endpoint = mode === "generate" ? "/api/optimize" : "/api/review";
-      const body = mode === "generate"
-        ? {
-            prompt: prompt.trim(),
-            iteration_cap: iterationCap,
-            pylint_threshold: pylintThreshold,
-          }
-        : {
-            code: code.trim(),
-            iteration_cap: iterationCap,
-            pylint_threshold: pylintThreshold,
-          };
+      const body =
+        mode === "generate"
+          ? {
+              prompt: prompt.trim(),
+              iteration_cap: iterationCap,
+              pylint_threshold: pylintThreshold,
+            }
+          : {
+              code: code.trim(),
+              iteration_cap: iterationCap,
+              pylint_threshold: pylintThreshold,
+            };
 
       const response = await fetch(`${API_BASE_URL}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
+      setLiveApiCalls((n) => n + 1);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
@@ -83,10 +209,7 @@ export default function App() {
       }
 
       const data = await response.json();
-      setResult(data);
-      if (data.iterations && data.iterations.length > 0) {
-        setActiveTab(data.iterations.length - 1); // Select the latest iteration
-      }
+      setResult(enrichLiveResult(data));
     } catch (err) {
       setError(err.message || "Failed to communicate with optimization backend");
     } finally {
@@ -94,14 +217,14 @@ export default function App() {
     }
   };
 
-  const copyCode = (code) => {
-    navigator.clipboard.writeText(code);
+  const copyCode = (text) => {
+    navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const downloadReport = async () => {
-    if (!result) return;
+    if (!result || mode === "demo") return;
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/report`, {
@@ -139,36 +262,48 @@ export default function App() {
     }
   };
 
+  const isDemo = mode === "demo";
+  const isFixture = recording?.recording_type === "test_fixture";
+  const historicalCalls = recording?.api_call_count ?? "N/A";
+
   return (
     <div className="app-container">
-      {/* Header */}
-      <header className="app-header">
-        <div className="header-brand">
-          <div className="logo-badge">AI</div>
-          <div>
-            <h1>AICodeQuality</h1>
-            <p className="subtitle">
-              Automated Code Enhancement Loop &middot; Gemini Flash + Bandit + Pylint
-            </p>
-          </div>
-        </div>
-        <div className="header-meta">
-          <span className="api-badge">API: {API_BASE_URL}</span>
-        </div>
-      </header>
+      <Header
+        backendStatus={isDemo ? "demo" : "unknown"}
+        geminiStatus={isDemo ? "demo" : "unknown"}
+        extra={
+          isDemo ? (
+            <div className={`demo-badge ${isFixture ? "fixture" : "recorded"}`} data-testid="demo-badge">
+              <strong>{isFixture ? "TEST FIXTURE" : "RECORDED RUN"}</strong>
+              <span>
+                {isFixture ? "Not a real experimental run" : "Playback mode • 0 LLM calls"}
+              </span>
+            </div>
+          ) : (
+            <span className="api-badge">API: {API_BASE_URL}</span>
+          )
+        }
+      />
 
-      {/* Main Content */}
       <main className="main-content">
-        {/* Input Card */}
+        <Pipeline activeStage={pipelineActive} completedStages={pipelineCompleted} />
+        <AnalysisTools activeTool={activeTool} />
+
         <section className="card input-card">
           <div className="card-header">
-            <h2>1. {mode === "generate" ? "Describe Code or Paste Requirements" : "Review Existing Code"}</h2>
+            <h2>
+              {isDemo
+                ? "Demo (recorded run)"
+                : mode === "generate"
+                  ? "1. Describe Code or Paste Requirements"
+                  : "1. Review Existing Code"}
+            </h2>
             <div className="mode-toggle">
               <button
                 type="button"
                 className={`mode-btn ${mode === "generate" ? "active" : ""}`}
                 onClick={() => setMode("generate")}
-                disabled={loading}
+                disabled={loading || playing}
               >
                 Generate
               </button>
@@ -176,12 +311,50 @@ export default function App() {
                 type="button"
                 className={`mode-btn ${mode === "review" ? "active" : ""}`}
                 onClick={() => setMode("review")}
-                disabled={loading}
+                disabled={loading || playing}
               >
                 Review
               </button>
+              <button
+                type="button"
+                className={`mode-btn demo ${mode === "demo" ? "active" : ""}`}
+                onClick={() => setMode("demo")}
+                disabled={loading || playing}
+                data-testid="demo-mode-btn"
+              >
+                Demo (recorded run)
+              </button>
             </div>
           </div>
+
+          {isDemo && recording && (
+            <div className="demo-meta" data-testid="demo-meta">
+              {isFixture ? (
+                <>
+                  <p className="demo-title">Demo (test fixture)</p>
+                  <p className="demo-warning">NOT A REAL EXPERIMENTAL RUN</p>
+                </>
+              ) : (
+                <>
+                  <p className="demo-title">Demo (recorded run)</p>
+                  <p>Recorded: {recording.created_at}</p>
+                </>
+              )}
+              <p>
+                Historical LLM calls: <strong data-testid="historical-llm-calls">{historicalCalls}</strong>
+              </p>
+              <p>
+                Playback LLM calls: <strong data-testid="playback-llm-calls">{playbackLlmCalls}</strong>
+              </p>
+              <p>
+                API Calls During Playback: <strong data-testid="playback-api-calls">{playbackLlmCalls}</strong>
+              </p>
+              <p className="demo-note">
+                Recorded run: {historicalCalls} LLM calls · Current playback: {playbackLlmCalls} LLM
+                calls
+              </p>
+            </div>
+          )}
 
           {mode === "generate" && (
             <>
@@ -244,70 +417,138 @@ export default function App() {
             </>
           )}
 
-          <div className="action-row">
-            <div className="settings-controls">
-              <div className="setting-group">
-                <label htmlFor="iteration-cap" className="setting-label">
-                  Iteration Cap:
-                </label>
-                <select
-                  id="iteration-cap"
-                  className="setting-select"
-                  value={iterationCap}
-                  onChange={(e) => setIterationCap(parseInt(e.target.value))}
-                  disabled={loading}
-                >
-                  <option value={1}>1</option>
-                  <option value={2}>2</option>
-                  <option value={3}>3</option>
-                  <option value={4}>4</option>
-                  <option value={5}>5</option>
-                </select>
-              </div>
-              <div className="setting-group">
-                <label htmlFor="pylint-threshold" className="setting-label">
-                  Pylint Threshold:
-                </label>
-                <select
-                  id="pylint-threshold"
-                  className="setting-select"
-                  value={pylintThreshold}
-                  onChange={(e) => setPylintThreshold(parseFloat(e.target.value))}
-                  disabled={loading}
-                >
-                  <option value={6.0}>6.0</option>
-                  <option value={7.0}>7.0</option>
-                  <option value={8.0}>8.0</option>
-                  <option value={9.0}>9.0</option>
-                  <option value={10.0}>10.0</option>
-                </select>
-              </div>
-              <div className="threshold-info">
-                <span className="info-text">Bandit High/Med = 0</span>
-              </div>
+          {isDemo && (
+            <div className="prompt-wrapper">
+              <textarea
+                id="demo-prompt"
+                rows={3}
+                value={prompt}
+                readOnly
+                disabled
+              />
             </div>
-            <button
-              id="run-button"
-              className={`run-btn ${loading ? "running" : ""}`}
-              onClick={handleRun}
-              disabled={loading || (mode === "generate" && !prompt.trim()) || (mode === "review" && !code.trim())}
-            >
-              {loading ? (
-                <>
-                  <span className="spinner"></span>
-                  <span>{mode === "generate" ? "Optimizing Code..." : "Reviewing Code..."}</span>
-                </>
-              ) : (
-                <>
-                  <span>{mode === "generate" ? "Run Convergence Loop" : "Review & Improve Code"}</span>
-                  <span className="arrow-icon">&rarr;</span>
-                </>
-              )}
-            </button>
+          )}
+
+          <div className="action-row">
+            {!isDemo && (
+              <div className="settings-controls">
+                <div className="setting-group">
+                  <label htmlFor="iteration-cap" className="setting-label">
+                    Iteration Cap:
+                  </label>
+                  <select
+                    id="iteration-cap"
+                    className="setting-select"
+                    value={iterationCap}
+                    onChange={(e) => setIterationCap(parseInt(e.target.value))}
+                    disabled={loading}
+                  >
+                    <option value={1}>1</option>
+                    <option value={2}>2</option>
+                    <option value={3}>3</option>
+                    <option value={4}>4</option>
+                    <option value={5}>5</option>
+                  </select>
+                </div>
+                <div className="setting-group">
+                  <label htmlFor="pylint-threshold" className="setting-label">
+                    Pylint Threshold:
+                  </label>
+                  <select
+                    id="pylint-threshold"
+                    className="setting-select"
+                    value={pylintThreshold}
+                    onChange={(e) => setPylintThreshold(parseFloat(e.target.value))}
+                    disabled={loading}
+                  >
+                    <option value={6.0}>6.0</option>
+                    <option value={7.0}>7.0</option>
+                    <option value={8.0}>8.0</option>
+                    <option value={9.0}>9.0</option>
+                    <option value={10.0}>10.0</option>
+                  </select>
+                </div>
+                <div className="threshold-info">
+                  <span className="info-text">Bandit High/Med = 0</span>
+                </div>
+              </div>
+            )}
+
+            {isDemo ? (
+              <div className="playback-controls" data-testid="playback-controls">
+                <button
+                  type="button"
+                  className="run-btn"
+                  data-testid="replay-btn"
+                  onClick={() => startDemoPlayback(false)}
+                  disabled={playing}
+                >
+                  ▶ Replay
+                </button>
+                <button
+                  type="button"
+                  className="preset-btn"
+                  data-testid="restart-btn"
+                  onClick={() => {
+                    setResult(null);
+                    startDemoPlayback(false);
+                  }}
+                >
+                  ↻ Restart
+                </button>
+                <button
+                  type="button"
+                  className="preset-btn"
+                  data-testid="skip-btn"
+                  onClick={() => startDemoPlayback(true)}
+                >
+                  ⏭ Skip to Results
+                </button>
+                <div className="speed-toggle">
+                  <span>Playback speed:</span>
+                  <button
+                    type="button"
+                    className={`toggle-btn ${playbackSpeed === 1 ? "active" : ""}`}
+                    onClick={() => setPlaybackSpeed(1)}
+                  >
+                    1×
+                  </button>
+                  <button
+                    type="button"
+                    className={`toggle-btn ${playbackSpeed === 2 ? "active" : ""}`}
+                    onClick={() => setPlaybackSpeed(2)}
+                  >
+                    2×
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                id="run-button"
+                className={`run-btn ${loading ? "running" : ""}`}
+                onClick={handleRun}
+                disabled={
+                  loading ||
+                  (mode === "generate" && !prompt.trim()) ||
+                  (mode === "review" && !code.trim())
+                }
+              >
+                {loading ? (
+                  <>
+                    <span className="spinner"></span>
+                    <span>{mode === "generate" ? "Optimizing Code..." : "Reviewing Code..."}</span>
+                  </>
+                ) : (
+                  <>
+                    <span>{mode === "generate" ? "Run Convergence Loop" : "Review & Improve Code"}</span>
+                    <span className="arrow-icon">&rarr;</span>
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </section>
 
-        {/* Loading Indicator View */}
         {loading && (
           <section className="card loading-card">
             <div className="loading-animation">
@@ -321,371 +562,25 @@ export default function App() {
           </section>
         )}
 
-        {/* Error View */}
         {error && (
-          <section className="card error-card">
+          <section className="card error-card" data-testid="error-card">
             <div className="error-title">Optimization Error</div>
-            <div className="error-body">{error}</div>
+            <div className="error-body">{typeof error === "string" ? error : error}</div>
           </section>
         )}
 
-        {/* Results Section */}
-        {result && (
-          <section className="results-container">
-            {/* Status Summary Banner */}
-            <div className={`summary-banner ${result.converged ? "converged" : "cap-reached"}`}>
-              <div className="banner-left">
-                <span className="status-indicator-dot"></span>
-                <div>
-                  <h3 className="banner-title">
-                    {result.converged
-                      ? `Convergence Satisfied in Iteration ${result.total_iterations}!`
-                      : `Iteration Cap (${result.total_iterations}) Reached`}
-                  </h3>
-                  <p className="banner-subtitle">
-                    Status: <strong>{result.status}</strong> &bull; Total Cycles:{" "}
-                    <strong>{result.total_iterations}</strong> &bull; Cap:{" "}
-                    <strong>{result.iteration_cap}</strong> &bull; Threshold:{" "}
-                    <strong>{result.pylint_threshold}</strong>
-                  </p>
-                </div>
-              </div>
+        {!result && !loading && !playing && <EmptyState />}
 
-              <div className="banner-stats">
-                <div className="stat-box">
-                  <div className="stat-label">Final Pylint Score</div>
-                  <div className="stat-val">{result.final_pylint_score.toFixed(2)} / 10</div>
-                </div>
-                <div className="stat-box">
-                  <div className="stat-label">Bandit High/Med</div>
-                  <div className={`stat-val ${result.final_bandit_high_medium === 0 ? "good" : "bad"}`}>
-                    {result.final_bandit_high_medium}
-                  </div>
-                </div>
-                {result.metrics_summary?.final_maintainability_index !== null && (
-                  <div className="stat-box">
-                    <div className="stat-label">Maintainability Index</div>
-                    <div className="stat-val">
-                      {result.metrics_summary.final_maintainability_index.toFixed(2)}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Before / After Metrics Table */}
-            {result.metrics_summary && (
-              <div className="card metrics-card">
-                <div className="card-header">
-                  <h2>2. Before & After Quality Comparison</h2>
-                  <span className="badge-highlight">
-                    Score Delta:{" "}
-                    {result.metrics_summary.pylint_score_delta >= 0 ? "+" : ""}
-                    {result.metrics_summary.pylint_score_delta.toFixed(2)} pts
-                  </span>
-                </div>
-
-                <div className="metrics-grid">
-                  <div className="metric-box">
-                    <span className="metric-label">Pylint Score</span>
-                    <div className="metric-comparison">
-                      <span className="val-before">
-                        {result.metrics_summary.initial_pylint_score.toFixed(2)}
-                      </span>
-                      <span className="arrow-change">&rarr;</span>
-                      <span className="val-after">
-                        {result.metrics_summary.final_pylint_score.toFixed(2)}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="metric-box">
-                    <span className="metric-label">Total Diagnostic Issues</span>
-                    <div className="metric-comparison">
-                      <span className="val-before">
-                        {result.metrics_summary.initial_total_issues}
-                      </span>
-                      <span className="arrow-change">&rarr;</span>
-                      <span className="val-after">
-                        {result.metrics_summary.final_total_issues}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="metric-box">
-                    <span className="metric-label">Issues Resolved</span>
-                    <div className="metric-comparison single-val green">
-                      {result.metrics_summary.issues_eliminated >= 0
-                        ? `-${result.metrics_summary.issues_eliminated}`
-                        : `+${Math.abs(result.metrics_summary.issues_eliminated)}`}
-                    </div>
-                  </div>
-
-                  <div className="metric-box">
-                    <span className="metric-label">Quality Threshold</span>
-                    <div className="metric-comparison single-val">
-                      {result.converged ? (
-                        <span className="badge-pass">PASSED</span>
-                      ) : (
-                        <span className="badge-fail">UNRESOLVED</span>
-                      )}
-                    </div>
-                  </div>
-
-                  {result.metrics_summary.initial_avg_complexity !== null && (
-                    <div className="metric-box">
-                      <span className="metric-label">Avg Complexity</span>
-                      <div className="metric-comparison">
-                        <span className="val-before">
-                          {result.metrics_summary.initial_avg_complexity.toFixed(2)}
-                        </span>
-                        <span className="arrow-change">&rarr;</span>
-                        <span className="val-after">
-                          {result.metrics_summary.final_avg_complexity.toFixed(2)}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-
-                  {result.metrics_summary.initial_maintainability_index !== null && (
-                    <div className="metric-box">
-                      <span className="metric-label">Maintainability Index</span>
-                      <div className="metric-comparison">
-                        <span className="val-before">
-                          {result.metrics_summary.initial_maintainability_index.toFixed(2)}
-                        </span>
-                        <span className="arrow-change">&rarr;</span>
-                        <span className="val-after">
-                          {result.metrics_summary.final_maintainability_index.toFixed(2)}
-                        </span>
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Formatted ASCII Summary Table */}
-                <div className="ascii-table-container">
-                  <pre className="ascii-table">{result.metrics_summary.table}</pre>
-                </div>
-              </div>
-            )}
-
-            {/* Charts */}
-            <Charts result={result} />
-
-            {/* Iteration Breakdown & Diffs */}
-            {result.iterations && result.iterations.length > 0 && (
-              <div className="card iterations-card">
-                <div className="card-header">
-                  <h2>3. Iteration Breakdown & Code Diffs</h2>
-                  <div className="iteration-tabs">
-                    {result.iterations.map((it, idx) => (
-                      <button
-                        key={idx}
-                        className={`tab-btn ${activeTab === idx ? "active" : ""}`}
-                        onClick={() => setActiveTab(idx)}
-                      >
-                        Iteration {it.iteration}
-                        <span className={`pill-score ${it.threshold_met ? "good" : ""}`}>
-                          {it.pylint_score.toFixed(1)}/10
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Selected Iteration Detail */}
-                {result.iterations[activeTab] && (
-                  <div className="tab-content">
-                    <div className="iter-meta-row">
-                      <div className="meta-badge">
-                        <span>Pylint Score:</span>
-                        <strong>{result.iterations[activeTab].pylint_score.toFixed(2)}/10</strong>
-                      </div>
-                      <div className="meta-badge">
-                        <span>Bandit High/Med:</span>
-                        <strong
-                          className={
-                            result.iterations[activeTab].bandit_high_medium_count === 0
-                              ? "good"
-                              : "bad"
-                          }
-                        >
-                          {result.iterations[activeTab].bandit_high_medium_count}
-                        </strong>
-                      </div>
-                      <div className="meta-badge">
-                        <span>Total Issues:</span>
-                        <strong>{result.iterations[activeTab].total_issues_count}</strong>
-                      </div>
-                      <div className="meta-badge">
-                        <span>Threshold Met:</span>
-                        <strong
-                          className={
-                            result.iterations[activeTab].threshold_met ? "good" : "bad"
-                          }
-                        >
-                          {result.iterations[activeTab].threshold_met ? "YES" : "NO"}
-                        </strong>
-                      </div>
-                    </div>
-
-                    {/* Extracted Issues List */}
-                    {result.iterations[activeTab].issues &&
-                      result.iterations[activeTab].issues.length > 0 && (
-                        <div className="issues-list">
-                          <h4 className="issues-title">
-                            Diagnostic Issues Identified in Iteration {result.iterations[activeTab].iteration}:
-                          </h4>
-                          <ul>
-                            {result.iterations[activeTab].issues.map((iss, i) => (
-                              <li key={i} className={`issue-item ${iss.severity.toLowerCase()}`}>
-                                <span className={`severity-tag ${iss.severity.toLowerCase()}`}>
-                                  [{iss.severity}]
-                                </span>
-                                <span className="issue-tool">{iss.tool}</span>
-                                <span className="issue-line">Line {iss.line}</span>
-                                <span className="issue-rule">({iss.rule_id})</span>
-                                <span className="issue-msg">{iss.message}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-
-                    {/* Side-by-side or line diff view */}
-                    {result.iterations[activeTab].diff_lines &&
-                    result.iterations[activeTab].diff_lines.length > 0 ? (
-                      <div className="diff-view-section">
-                        <div className="diff-header">
-                          <div className="diff-title-row">
-                            <h4>
-                              Code Changes (Iteration {result.iterations[activeTab].iteration - 1} &rarr; Iteration {result.iterations[activeTab].iteration})
-                            </h4>
-                            <div className="diff-stats-badges">
-                              <span className="badge-stat-add">
-                                +{result.iterations[activeTab].diff_lines.filter(l => l.type === "insert" || l.type === "replace").length} added
-                              </span>
-                              <span className="badge-stat-del">
-                                -{result.iterations[activeTab].diff_lines.filter(l => l.type === "delete" || l.type === "replace").length} removed
-                              </span>
-                            </div>
-                          </div>
-
-                          <div className="diff-controls">
-                            <div className="diff-mode-toggle">
-                              <button
-                                type="button"
-                                className={`toggle-btn ${diffMode === "side-by-side" ? "active" : ""}`}
-                                onClick={() => setDiffMode("side-by-side")}
-                              >
-                                Side-by-Side
-                              </button>
-                              <button
-                                type="button"
-                                className={`toggle-btn ${diffMode === "unified" ? "active" : ""}`}
-                                onClick={() => setDiffMode("unified")}
-                              >
-                                Unified
-                              </button>
-                            </div>
-                            <div className="diff-legend">
-                              <span className="legend-del"><span className="legend-marker">-</span> Removed</span>
-                              <span className="legend-add"><span className="legend-marker">+</span> Added</span>
-                            </div>
-                          </div>
-                        </div>
-
-                        {diffMode === "unified" ? (
-                          <div className="unified-diff-view">
-                            <pre className="unified-diff-pre">
-                              {result.iterations[activeTab].diff || "No text diff available"}
-                            </pre>
-                          </div>
-                        ) : (
-                          <div className="side-by-side-diff">
-                            <div className="diff-column old-column">
-                              <div className="column-title">
-                                <span>Previous Iteration ({result.iterations[activeTab].iteration - 1})</span>
-                              </div>
-                              <div className="diff-code-block">
-                                {result.iterations[activeTab].diff_lines.map((dl, dIdx) => (
-                                  <div
-                                    key={dIdx}
-                                    className={`diff-line ${dl.type === "delete" || dl.type === "replace" ? "line-deleted" : ""}`}
-                                  >
-                                    <span className="line-num">{dl.old_line_num || ""}</span>
-                                    <span className="line-marker">{dl.type === "delete" || dl.type === "replace" ? "-" : " "}</span>
-                                    <span className="line-text">{dl.old_line !== null ? dl.old_line : ""}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-
-                            <div className="diff-column new-column">
-                              <div className="column-title">
-                                <span>Refined Code (Iteration {result.iterations[activeTab].iteration})</span>
-                              </div>
-                              <div className="diff-code-block">
-                                {result.iterations[activeTab].diff_lines.map((dl, dIdx) => (
-                                  <div
-                                    key={dIdx}
-                                    className={`diff-line ${dl.type === "insert" || dl.type === "replace" ? "line-added" : ""}`}
-                                  >
-                                    <span className="line-num">{dl.new_line_num || ""}</span>
-                                    <span className="line-marker">{dl.type === "insert" || dl.type === "replace" ? "+" : " "}</span>
-                                    <span className="line-text">{dl.new_line !== null ? dl.new_line : ""}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="code-display-section">
-                        <div className="diff-header">
-                          <h4>Initial Code (Iteration {result.iterations[activeTab].iteration})</h4>
-                          <span className="badge-initial">Baseline Generation</span>
-                        </div>
-                        <pre className="code-pre">
-                          <code>{result.iterations[activeTab].code}</code>
-                        </pre>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Final Optimized Code Card */}
-            <div className="card final-code-card">
-              <div className="card-header">
-                <h2>4. Final Optimized Python Code</h2>
-                <div className="header-actions">
-                  <button
-                    className="download-btn"
-                    onClick={downloadReport}
-                  >
-                    Download Report
-                  </button>
-                  <button
-                    className="copy-btn"
-                    onClick={() => copyCode(result.final_code)}
-                  >
-                    {copied ? "Copied!" : "Copy Code"}
-                  </button>
-                </div>
-              </div>
-
-              <div className="code-container">
-                <pre className="code-pre">
-                  <code>{result.final_code}</code>
-                </pre>
-              </div>
-            </div>
-          </section>
-        )}
+        <ResultsView
+          result={result}
+          diffMode={diffMode}
+          onDiffModeChange={setDiffMode}
+          onCopy={copyCode}
+          copied={copied}
+          onDownloadReport={downloadReport}
+          allowReportDownload={!isDemo}
+          originalFallback={code}
+        />
       </main>
     </div>
   );

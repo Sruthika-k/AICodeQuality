@@ -22,6 +22,7 @@ from backend.app.config import (
     STOP_RULE_THRESHOLD,
     ExperimentConfig,
 )
+from backend.app.exceptions import JobCancelled
 from backend.app.feedback_generator import FeedbackGenerator
 from backend.app.issue_extractor import IssueExtractor
 from backend.app.llm_interface import LLMInterface
@@ -308,6 +309,14 @@ class LoopController:
         self.api_calls_used += 1
         return result
 
+    def _notify_job(self, callback, iteration: int, stage: str) -> None:
+        if callback:
+            callback({"current_iteration": iteration, "stage": stage})
+
+    def _raise_if_cancelled(self, job_cancel_check) -> None:
+        if job_cancel_check and job_cancel_check():
+            raise JobCancelled("Job cancelled")
+
     def _is_plateau_pylint(self, history: List[IterationData]) -> bool:
         """Legacy plateau based on pylint_score range — retained for backward reference."""
         window = self.config.plateau_window
@@ -429,12 +438,22 @@ class LoopController:
             return True
         return False
 
-    def run(self, prompt: str, initial_code: Optional[str] = None) -> LoopResult:
+    def run(
+        self,
+        prompt: str,
+        initial_code: Optional[str] = None,
+        run_id: Optional[str] = None,
+        job_status_callback: Optional[callable] = None,
+        job_cancel_check: Optional[callable] = None,
+    ) -> LoopResult:
         """Run the refinement loop on the user prompt.
 
         Args:
             prompt: User description of the desired Python program.
             initial_code: Optional starting code snippet (skips initial generation if provided).
+            run_id: Optional job ID for tracking (used in async jobs).
+            job_status_callback: Optional callback to update job status.
+            job_cancel_check: Optional callable to check if job was cancelled.
 
         Returns:
             LoopResult with complete iteration history, before/after summary, and final code.
@@ -464,12 +483,17 @@ class LoopController:
         print(f"{'='*70}")
 
         for i in range(1, self.iteration_cap + 1):
+            self._raise_if_cancelled(job_cancel_check)
+            self._notify_job(job_status_callback, i, "refinement")
+
             print(f"\n--- [Iteration {i}/{self.iteration_cap}] ---")
 
             if current_code is None:
                 print("Generating initial code from prompt...")
+                self._notify_job(job_status_callback, i, "gemini")
                 gen_prompt = self._build_generation_prompt(prompt)
                 current_code = self._generate(gen_prompt)
+                self._raise_if_cancelled(job_cancel_check)
 
             # 2. Run Static Analysis
             print(
@@ -477,6 +501,7 @@ class LoopController:
                 + (" + Radon complexity/MI" if self.config.enable_radon else "")
                 + ")..."
             )
+            self._notify_job(job_status_callback, i, "analysis")
             analysis: StaticAnalysisResult = self.analyzer.analyze(
                 current_code,
                 enable_radon=self.config.enable_radon,
@@ -571,6 +596,8 @@ class LoopController:
             candidate_iter.accepted = accepted_bool
             candidate_iter.acceptance_reason = acc_reason
 
+            self._notify_job(job_status_callback, i, "acceptance")
+
             # Generate feedback_text now that we know acceptance for regression_aware (uses prior iteration history)
             if i < self.iteration_cap and not self.config.is_single_shot:
                 sr = self.config.stop_rule
@@ -587,6 +614,7 @@ class LoopController:
                             fb_kwargs["previous_issues"] = []
                             fb_kwargs["previous_rejected"] = False
                         fb_kwargs["current_all_issues"] = raw_issues
+                    self._notify_job(job_status_callback, i, "feedback")
                     feedback_text = self.feedback_gen.generate_feedback(**fb_kwargs)
             candidate_iter.feedback_text = feedback_text
 
@@ -676,6 +704,8 @@ class LoopController:
             # IMPORTANT: use the code of the last ACCEPTED version (code_for_next_generation)
             # as the code in the prompt block — never build on top of a rejected candidate.
             print("Constructing feedback prompt for LLM repair...")
+            self._raise_if_cancelled(job_cancel_check)
+            self._notify_job(job_status_callback, i, "gemini")
             prompt_base_code = code_for_next_generation if code_for_next_generation is not None else current_code
             refinement_prompt = (
                 f"The following Python code was analyzed and failed quality/security checks:\n\n"
@@ -770,6 +800,8 @@ class LoopController:
             introduced_instances=introduced_instances_total,
             resolved_instances=resolved_instances_total,
         )
+
+        self._notify_job(job_status_callback, len(iterations_history), "best")
 
         return LoopResult(
             prompt=prompt,

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -14,7 +15,10 @@
     "recharts": "^3.10.1"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.0.1",
     "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.4.2"
+    "jsdom": "^25.0.1",
+    "vite": "^5.4.2",
+    "vitest": "^2.1.4"
   }
 }

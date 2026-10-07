@@ -2,16 +2,22 @@
 
 import logging
 import os
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
+from backend.app.exceptions import QuotaExceeded
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 
+from backend.app.demo_llm import DemoLLM
 from backend.app.loop_controller import LoopController, LoopResult
 from backend.app.report_generator import generate_markdown_report
+from backend.app.exceptions import JobCancelled, QuotaExceeded
 
 # Configure secure logging
 log_dir = Path(__file__).parent.parent / "logs"
@@ -148,6 +154,222 @@ class CodeOptimizationResponse(BaseModel):
     metrics_summary: Optional[BeforeAfterSummaryModel] = None
     iteration_cap: int
     pylint_threshold: float
+
+
+# Job system for async refinement
+class BackgroundRunRequest(BaseModel):
+    mode: str = Field("generate", description="'generate' or 'review'")
+    prompt: Optional[str] = Field(None, max_length=10000)
+    code: Optional[str] = Field(None, max_length=50000)
+    iteration_cap: int = Field(3, ge=1, le=5)
+    pylint_threshold: float = Field(8.0, ge=0.0, le=10.0)
+    demo: bool = Field(False, description="If true, use the local demo LLM (no Gemini)")
+
+    @field_validator('prompt')
+    @classmethod
+    def validate_prompt_size(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(v.encode('utf-8')) > 10000:
+            raise ValueError("Prompt exceeds 10KB limit")
+        return v
+
+    @field_validator('code')
+    @classmethod
+    def validate_code_size(cls, v: Optional[str]) -> Optional[str]:
+        if v and len(v.encode('utf-8')) > 50000:
+            raise ValueError("Code exceeds 50KB limit")
+        return v
+
+
+class RunStatusResponse(BaseModel):
+    id: str
+    status: str  # "queued", "running", "done", "failed", "cancelled"
+    stage: Optional[str] = None
+    current_iteration: int = 0
+    events: List[Dict[str, Any]] = []
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = None
+
+
+# In-memory job store (no database). Tests may set llm_override to inject FakeLLM.
+jobs_store: Dict[str, Dict[str, Any]] = {}
+jobs_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=5)
+llm_override: Optional[Callable[[], Any]] = None
+
+
+def _public_job_view(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "stage": job.get("stage"),
+        "current_iteration": job.get("current_iteration", 0),
+        "events": list(job.get("events") or []),
+        "result": job.get("result"),
+        "error": job.get("error"),
+    }
+
+
+def _resolve_llm(demo: bool = False):
+    if llm_override is not None:
+        return llm_override()
+    if demo:
+        return DemoLLM()
+    return None
+
+
+def _classify_job_error(exc: BaseException) -> Dict[str, Any]:
+    if isinstance(exc, QuotaExceeded):
+        return {
+            "code": "quota_exhausted",
+            "message": "Gemini quota is exhausted. Wait and retry, or try demo mode.",
+            "retry_after": getattr(exc, "retry_after", 0) or 60,
+        }
+    text = str(exc).lower()
+    if isinstance(exc, TimeoutError) or "timed out" in text or "timeout" in text:
+        return {"code": "timeout", "message": "The refinement run timed out."}
+    if "rate limit" in text or "resourceexhausted" in text or "quota" in text or "429" in text:
+        return {
+            "code": "quota_exhausted",
+            "message": "Gemini quota is exhausted. Wait and retry, or try demo mode.",
+            "retry_after": 60,
+        }
+    return {"code": "internal_error", "message": type(exc).__name__}
+
+
+def run_job_in_thread(job_id: str, request: BackgroundRunRequest):
+    """Run a refinement job in a background thread."""
+    with jobs_lock:
+        job = jobs_store[job_id]
+        job["status"] = "running"
+        job["stage"] = "queued"
+
+    def status_callback(update_dict):
+        safe = {
+            k: v
+            for k, v in update_dict.items()
+            if k in ("stage", "current_iteration")
+        }
+        with jobs_lock:
+            job.update(safe)
+            job["events"].append({"time": datetime.now().isoformat(), **safe})
+
+    def cancel_check():
+        with jobs_lock:
+            return job.get("cancelled", False)
+
+    try:
+        controller = LoopController(
+            iteration_cap=request.iteration_cap,
+            pylint_threshold=request.pylint_threshold,
+            max_bandit_high_med=0,
+            llm=_resolve_llm(demo=request.demo),
+        )
+
+        prompt = request.prompt
+        initial_code = None
+        if request.mode == "review":
+            prompt = "Review and improve the provided Python code while preserving its behavior."
+            initial_code = request.code.strip() if request.code else None
+        else:
+            initial_code = request.code.strip() if request.code else None
+
+        job["stage"] = "Running refinement"
+        result = controller.run(
+            prompt=prompt.strip() if prompt else "",
+            initial_code=initial_code,
+            run_id=job_id,
+            job_status_callback=status_callback,
+            job_cancel_check=cancel_check
+        )
+
+        # Convert iterations to response format
+        formatted_iterations = []
+        for it in result.iterations:
+            formatted_iterations.append(
+                IterationModel(
+                    iteration=it.iteration,
+                    code=it.code,
+                    pylint_score=it.pylint_score,
+                    bandit_high_medium_count=it.bandit_high_medium_count,
+                    bandit_low_count=it.bandit_low_count,
+                    pylint_issue_count=it.pylint_issue_count,
+                    total_issues_count=it.total_issues_count,
+                    has_syntax_error=it.has_syntax_error,
+                    threshold_met=it.threshold_met,
+                    feedback_text=it.feedback_text,
+                    diff=it.diff,
+                    diff_lines=it.diff_lines,
+                    issues=[
+                        IssueModel(
+                            tool=issue.tool,
+                            severity=issue.severity,
+                            line=issue.line,
+                            message=issue.message,
+                            rule_id=issue.rule_id,
+                        )
+                        for issue in it.extracted_issues
+                    ],
+                ).model_dump()
+            )
+
+        summary_model = None
+        if result.before_after_summary:
+            s = result.before_after_summary
+            summary_model = BeforeAfterSummaryModel(
+                initial_iteration=s.initial_iteration,
+                final_iteration=s.final_iteration,
+                total_iterations=s.total_iterations,
+                converged=s.converged,
+                initial_pylint_score=s.initial_pylint_score,
+                final_pylint_score=s.final_pylint_score,
+                pylint_score_delta=s.pylint_score_delta,
+                initial_total_issues=s.initial_total_issues,
+                final_total_issues=s.final_total_issues,
+                issues_eliminated=s.issues_eliminated,
+                table=s.table,
+                initial_avg_complexity=s.initial_avg_complexity,
+                final_avg_complexity=s.final_avg_complexity,
+                initial_max_complexity=s.initial_max_complexity,
+                final_max_complexity=s.final_max_complexity,
+                initial_maintainability_index=s.initial_maintainability_index,
+                final_maintainability_index=s.final_maintainability_index,
+            ).model_dump()
+
+        res = {
+            "prompt": result.prompt,
+            "final_code": result.final_code,
+            "converged": result.converged,
+            "total_iterations": result.total_iterations,
+            "final_pylint_score": result.final_pylint_score,
+            "final_bandit_high_medium": result.final_bandit_high_medium,
+            "status": result.status,
+            "iterations": formatted_iterations,
+            "metrics_summary": summary_model,
+            "iteration_cap": request.iteration_cap,
+            "pylint_threshold": request.pylint_threshold,
+        }
+
+        with jobs_lock:
+            if job.get("cancelled"):
+                job["status"] = "cancelled"
+                job["stage"] = "cancelled"
+                job["result"] = None
+            else:
+                job["status"] = "done"
+                job["result"] = res
+                job["stage"] = "best"
+
+    except JobCancelled:
+        with jobs_lock:
+            job["status"] = "cancelled"
+            job["stage"] = "cancelled"
+    except Exception as exc:
+        classified = _classify_job_error(exc)
+        logger.error("Job %s failed: %s", job_id, classified["code"])
+        with jobs_lock:
+            job["status"] = "failed"
+            job["error"] = classified
+            job["stage"] = classified["code"]
 
 
 @app.get("/health", tags=["Health"])
@@ -365,6 +587,55 @@ def review_code(request: CodeReviewRequest) -> CodeOptimizationResponse:
     except Exception as exc:
         logger.error(f"Unexpected error in review: {type(exc).__name__}: {str(exc)}")
         raise HTTPException(status_code=500, detail=f"Loop execution failed: {str(exc)}") from exc
+
+
+# Job endpoints for async refinement
+@app.post("/api/runs", tags=["Jobs"])
+def create_run(request: BackgroundRunRequest) -> Dict[str, str]:
+    """Create a new background refinement job and return its ID."""
+    if request.mode == "generate" and not request.prompt:
+        raise HTTPException(status_code=400, detail="Prompt must not be empty for generate mode.")
+    if request.mode == "review" and not request.code:
+        raise HTTPException(status_code=400, detail="Code must not be empty for review mode.")
+
+    run_id = uuid.uuid4().hex[:8]
+    with jobs_lock:
+        jobs_store[run_id] = {
+            "id": run_id,
+            "status": "queued",
+            "stage": "queued",
+            "current_iteration": 0,
+            "events": [],
+            "result": None,
+            "error": None,
+            "cancelled": False,
+            "created_at": datetime.now().isoformat(),
+        }
+
+    executor.submit(run_job_in_thread, run_id, request)
+    logger.info("Created job %s (mode=%s demo=%s)", run_id, request.mode, request.demo)
+    return {"run_id": run_id}
+
+
+@app.get("/api/runs/{run_id}", response_model=RunStatusResponse, tags=["Jobs"])
+def get_run_status(run_id: str) -> RunStatusResponse:
+    """Get the status of a background refinement job."""
+    with jobs_lock:
+        if run_id not in jobs_store:
+            raise HTTPException(status_code=404, detail="Run not found")
+        view = _public_job_view(jobs_store[run_id])
+    return RunStatusResponse(**view)
+
+
+@app.post("/api/runs/{run_id}/cancel", tags=["Jobs"])
+def cancel_run(run_id: str) -> Dict[str, str]:
+    """Cancel a running refinement job."""
+    with jobs_lock:
+        if run_id not in jobs_store:
+            raise HTTPException(status_code=404, detail="Run not found")
+        jobs_store[run_id]["cancelled"] = True
+    logger.info("Cancellation requested for job %s", run_id)
+    return {"status": "cancelling"}
 
 
 class ReportRequest(BaseModel):

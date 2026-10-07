@@ -1,0 +1,199 @@
+{
+  "recording_version": "1.0",
+  "recording_type": "test_fixture",
+  "recording_id": "fixture_001",
+  "created_at": "2026-10-07T12:00:00+00:00",
+  "timing_source": "playback_defaults",
+  "metadata": {
+    "model": "none-test-fixture",
+    "mode": "generate",
+    "iteration_cap": 2
+  },
+  "input": {
+    "prompt": "Write a Python utility with a function execute_command(user_input) that evaluates math expressions with eval() or executes system commands using os.system(). Keep it quick and concise without docstrings.",
+    "original_code": "import os\n\ndef execute_command(user_input):\n    eval(user_input)\n    os.system(user_input)\n"
+  },
+  "configuration": {
+    "pylint_threshold": 8.0,
+    "bandit_threshold": "high_medium_zero"
+  },
+  "api_call_count": 0,
+  "timing_events": [
+    { "stage": "input", "duration_ms": 400 },
+    { "stage": "gemini", "duration_ms": 1400 },
+    { "stage": "bandit", "duration_ms": 500 },
+    { "stage": "pylint", "duration_ms": 700 },
+    { "stage": "radon", "duration_ms": 500 },
+    { "stage": "issue_extraction", "duration_ms": 400 },
+    { "stage": "feedback", "duration_ms": 800 },
+    { "stage": "refinement", "duration_ms": 1200 },
+    { "stage": "regression", "duration_ms": 600 },
+    { "stage": "acceptance", "duration_ms": 700 },
+    { "stage": "best", "duration_ms": 400 }
+  ],
+  "iterations": [
+    {
+      "iteration": 1,
+      "code": "import os\n\ndef execute_command(user_input):\n    eval(user_input)\n    os.system(user_input)\n",
+      "pylint_score": 3.5,
+      "bandit_high_medium_count": 2,
+      "bandit_low_count": 0,
+      "pylint_issue_count": 2,
+      "total_issues_count": 4,
+      "has_syntax_error": false,
+      "threshold_met": false,
+      "weighted_issue_score": 24,
+      "avg_complexity": 2.0,
+      "max_complexity": 2,
+      "maintainability_index": 55.0,
+      "feedback_text": "Remove eval() and os.system(); add a docstring, type hints, and a safe parser.",
+      "diff": null,
+      "diff_lines": [],
+      "accepted": true,
+      "acceptance_reason": "ACCEPTED_INITIAL",
+      "issues_eliminated": 0,
+      "issues_introduced": 0,
+      "issues": [
+        { "tool": "bandit", "severity": "HIGH", "line": 4, "message": "Use of possibly insecure function 'eval'", "rule_id": "B307" },
+        { "tool": "bandit", "severity": "HIGH", "line": 5, "message": "Starting a process with a shell, possible injection", "rule_id": "B605" },
+        { "tool": "pylint", "severity": "CONVENTION", "line": 3, "message": "Missing function docstring", "rule_id": "C0116" },
+        { "tool": "pylint", "severity": "WARNING", "line": 4, "message": "Use of eval", "rule_id": "W0123" }
+      ]
+    },
+    {
+      "iteration": 2,
+      "code": "import ast\nfrom typing import Any\n\n\ndef execute_command(user_input: str) -> Any:\n    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n    return ast.literal_eval(user_input)\n",
+      "pylint_score": 9.2,
+      "bandit_high_medium_count": 0,
+      "bandit_low_count": 0,
+      "pylint_issue_count": 0,
+      "total_issues_count": 0,
+      "has_syntax_error": false,
+      "threshold_met": true,
+      "weighted_issue_score": 0,
+      "avg_complexity": 1.0,
+      "max_complexity": 1,
+      "maintainability_index": 85.4,
+      "feedback_text": null,
+      "diff": "--- Iteration 1\n+++ Iteration 2\n@@ -1,5 +1,7 @@\n-import os\n+import ast\n+from typing import Any\n \n-def execute_command(user_input):\n-    eval(user_input)\n-    os.system(user_input)\n+\n+def execute_command(user_input: str) -> Any:\n+    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n+    return ast.literal_eval(user_input)",
+      "diff_lines": [
+        { "type": "delete", "old_line_num": 1, "new_line_num": null, "old_line": "import os", "new_line": null },
+        { "type": "insert", "old_line_num": null, "new_line_num": 1, "old_line": null, "new_line": "import ast" },
+        { "type": "insert", "old_line_num": null, "new_line_num": 2, "old_line": null, "new_line": "from typing import Any" }
+      ],
+      "accepted": true,
+      "acceptance_reason": "ACCEPTED_CONSTRAINED_OK",
+      "issues_eliminated": 4,
+      "issues_introduced": 0,
+      "issues": []
+    }
+  ],
+  "issue_evolution": {
+    "resolved": [
+      { "tool": "bandit", "rule_id": "B307", "message": "Use of possibly insecure function 'eval'" },
+      { "tool": "bandit", "rule_id": "B605", "message": "Starting a process with a shell, possible injection" },
+      { "tool": "pylint", "rule_id": "C0116", "message": "Missing function docstring" },
+      { "tool": "pylint", "rule_id": "W0123", "message": "Use of eval" }
+    ],
+    "introduced": [],
+    "persistent": []
+  },
+  "diffs": {
+    "original_code": "import os\n\ndef execute_command(user_input):\n    eval(user_input)\n    os.system(user_input)\n",
+    "final_code": "import ast\nfrom typing import Any\n\n\ndef execute_command(user_input: str) -> Any:\n    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n    return ast.literal_eval(user_input)\n",
+    "unified": "--- Iteration 1\n+++ Iteration 2\n@@ -1,5 +1,7 @@\n-import os\n+import ast\n+from typing import Any\n \n-def execute_command(user_input):\n-    eval(user_input)\n-    os.system(user_input)\n+\n+def execute_command(user_input: str) -> Any:\n+    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n+    return ast.literal_eval(user_input)"
+  },
+  "final": {
+    "code": "import ast\nfrom typing import Any\n\n\ndef execute_command(user_input: str) -> Any:\n    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n    return ast.literal_eval(user_input)\n",
+    "metrics": {
+      "pylint_score": 9.2,
+      "bandit_high_medium": 0,
+      "avg_complexity": 1.0,
+      "maintainability_index": 85.4
+    },
+    "decision": "accepted",
+    "decision_reason": "ACCEPTED_CONSTRAINED_OK",
+    "converged": true,
+    "status": "CONVERGED"
+  },
+  "result": {
+    "prompt": "Write a Python utility with a function execute_command(user_input) that evaluates math expressions with eval() or executes system commands using os.system(). Keep it quick and concise without docstrings.",
+    "final_code": "import ast\nfrom typing import Any\n\n\ndef execute_command(user_input: str) -> Any:\n    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n    return ast.literal_eval(user_input)\n",
+    "converged": true,
+    "total_iterations": 2,
+    "final_pylint_score": 9.2,
+    "final_bandit_high_medium": 0,
+    "status": "CONVERGED",
+    "iteration_cap": 2,
+    "pylint_threshold": 8.0,
+    "metrics_summary": {
+      "initial_iteration": 1,
+      "final_iteration": 2,
+      "total_iterations": 2,
+      "converged": true,
+      "initial_pylint_score": 3.5,
+      "final_pylint_score": 9.2,
+      "pylint_score_delta": 5.7,
+      "initial_total_issues": 4,
+      "final_total_issues": 0,
+      "issues_eliminated": 4,
+      "table": "fixture-table",
+      "initial_avg_complexity": 2.0,
+      "final_avg_complexity": 1.0,
+      "initial_max_complexity": 2,
+      "final_max_complexity": 1,
+      "initial_maintainability_index": 55.0,
+      "final_maintainability_index": 85.4,
+      "initial_bandit_high_medium": 2
+    },
+    "iterations": [
+      {
+        "iteration": 1,
+        "code": "import os\n\ndef execute_command(user_input):\n    eval(user_input)\n    os.system(user_input)\n",
+        "pylint_score": 3.5,
+        "bandit_high_medium_count": 2,
+        "bandit_low_count": 0,
+        "pylint_issue_count": 2,
+        "total_issues_count": 4,
+        "has_syntax_error": false,
+        "threshold_met": false,
+        "feedback_text": "Remove eval() and os.system(); add a docstring, type hints, and a safe parser.",
+        "diff": null,
+        "diff_lines": [],
+        "accepted": true,
+        "acceptance_reason": "ACCEPTED_INITIAL",
+        "issues_eliminated": 0,
+        "issues_introduced": 0,
+        "issues": [
+          { "tool": "bandit", "severity": "HIGH", "line": 4, "message": "Use of possibly insecure function 'eval'", "rule_id": "B307" },
+          { "tool": "bandit", "severity": "HIGH", "line": 5, "message": "Starting a process with a shell, possible injection", "rule_id": "B605" },
+          { "tool": "pylint", "severity": "CONVENTION", "line": 3, "message": "Missing function docstring", "rule_id": "C0116" },
+          { "tool": "pylint", "severity": "WARNING", "line": 4, "message": "Use of eval", "rule_id": "W0123" }
+        ]
+      },
+      {
+        "iteration": 2,
+        "code": "import ast\nfrom typing import Any\n\n\ndef execute_command(user_input: str) -> Any:\n    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n    return ast.literal_eval(user_input)\n",
+        "pylint_score": 9.2,
+        "bandit_high_medium_count": 0,
+        "bandit_low_count": 0,
+        "pylint_issue_count": 0,
+        "total_issues_count": 0,
+        "has_syntax_error": false,
+        "threshold_met": true,
+        "feedback_text": null,
+        "diff": "--- Iteration 1\n+++ Iteration 2\n@@ -1,5 +1,7 @@\n-import os\n+import ast\n+from typing import Any\n \n-def execute_command(user_input):\n-    eval(user_input)\n-    os.system(user_input)\n+\n+def execute_command(user_input: str) -> Any:\n+    \"\"\"Parse a Python literal from user input without executing code.\"\"\"\n+    return ast.literal_eval(user_input)",
+        "diff_lines": [
+          { "type": "delete", "old_line_num": 1, "new_line_num": null, "old_line": "import os", "new_line": null },
+          { "type": "insert", "old_line_num": null, "new_line_num": 1, "old_line": null, "new_line": "import ast" },
+          { "type": "insert", "old_line_num": null, "new_line_num": 2, "old_line": null, "new_line": "from typing import Any" }
+        ],
+        "accepted": true,
+        "acceptance_reason": "ACCEPTED_CONSTRAINED_OK",
+        "issues_eliminated": 4,
+        "issues_introduced": 0,
+        "issues": []
+      }
+    ]
+  }
+}
