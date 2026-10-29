@@ -154,8 +154,15 @@ class MetricsTracker:
         self.history.append(metric)
         return metric
 
-    def get_before_after_summary(self, converged: bool) -> BeforeAfterSummary:
-        """Produce a before/after quality comparison between the initial and final iterations."""
+    def get_before_after_summary(
+        self, converged: bool, final_iteration: Optional[int] = None
+    ) -> BeforeAfterSummary:
+        """Produce a before/after quality comparison between the initial and final iterations.
+
+        If final_iteration is provided, uses the metrics record for that iteration number
+        as the 'after' state (ensuring best-accepted candidate is compared rather than
+        a rejected candidate).
+        """
         if not self.history:
             dummy_metric = IterationMetrics(
                 iteration=0,
@@ -187,11 +194,16 @@ class MetricsTracker:
 
         initial = self.history[0]
         final = self.history[-1]
+        if final_iteration is not None:
+            for item in self.history:
+                if item.iteration == final_iteration:
+                    final = item
+                    break
 
         score_delta = round(final.pylint_score - initial.pylint_score, 2)
         issues_eliminated = initial.total_issues - final.total_issues
 
-        table_str = self.format_before_after_table(converged=converged)
+        table_str = self.format_before_after_table(converged=converged, final_iteration=final_iteration)
 
         return BeforeAfterSummary(
             initial_iteration=initial.iteration,
@@ -215,13 +227,20 @@ class MetricsTracker:
             final_maintainability_index=final.maintainability_index,
         )
 
-    def format_before_after_table(self, converged: Optional[bool] = None) -> str:
+    def format_before_after_table(
+        self, converged: Optional[bool] = None, final_iteration: Optional[int] = None
+    ) -> str:
         """Format an aligned before/after comparison table as a clean string."""
         if not self.history:
             return "No metrics history available."
 
         initial = self.history[0]
         final = self.history[-1]
+        if final_iteration is not None:
+            for item in self.history:
+                if item.iteration == final_iteration:
+                    final = item
+                    break
 
         # Helper to safely extract severity counts
         def get_count(m: IterationMetrics, tool: str, severity: str) -> int:

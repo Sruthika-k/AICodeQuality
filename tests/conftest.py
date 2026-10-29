@@ -81,8 +81,8 @@ class FakeLLM:
         self.error_on_call = error_on_call
         self.error_factory = error_factory
 
-    def generate(self, prompt: str, temperature: Optional[float] = None) -> str:
-        del prompt, temperature
+    def generate(self, prompt: str, temperature: Optional[float] = None, **kwargs) -> str:
+        del prompt, temperature, kwargs
         self.call_count += 1
         if self.error_on_call is not None and self.call_count == self.error_on_call:
             if self.error_factory is not None:

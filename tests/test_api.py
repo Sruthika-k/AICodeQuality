@@ -149,3 +149,87 @@ def test_optimize_endpoint_returns_full_structure():
         assert len(data["iterations"][1]["diff_lines"]) > 0
         assert data["metrics_summary"]["pylint_score_delta"] == 3.0
         assert data["metrics_summary"]["table"] == "+=== MOCK TABLE ===+"
+
+
+def test_real_generate_pipeline_with_fake_llm():
+    """Verify real Generate path: request -> /api/optimize -> LoopController -> FakeLLM -> static analysis -> result."""
+    import backend.app.main as main_mod
+    from tests.conftest import FakeLLM
+
+    clean_code = '''"""A clean module."""
+
+def add_numbers(a: int, b: int) -> int:
+    """Return sum of two numbers."""
+    return a + b
+'''
+    fake_llm = FakeLLM(responses=[clean_code])
+    main_mod.llm_override = lambda: fake_llm
+
+    try:
+        response = client.post(
+            "/api/optimize",
+            json={"prompt": "Write an addition function", "iteration_cap": 2, "pylint_threshold": 8.0},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check production response contract
+        assert "final_code" in data
+        assert "iterations" in data
+        assert "metrics_summary" in data
+        assert "converged" in data
+        assert "total_iterations" in data
+        assert "final_pylint_score" in data
+        assert "final_bandit_high_medium" in data
+
+        assert len(data["iterations"]) >= 1
+        it0 = data["iterations"][0]
+        assert "code" in it0
+        assert "pylint_score" in it0
+        assert "bandit_high_medium_count" in it0
+        assert "diff" in it0
+        assert "diff_lines" in it0
+        assert "threshold_met" in it0
+
+        # LLM boundary was called
+        assert fake_llm.call_count >= 1
+    finally:
+        main_mod.llm_override = None
+
+
+def test_real_review_pipeline_with_fake_llm():
+    """Verify real Review path: request -> /api/review -> LoopController -> FakeLLM -> static analysis -> result."""
+    import backend.app.main as main_mod
+    from tests.conftest import FakeLLM
+
+    fixed_code = '''"""Refined module."""
+
+def safe_math(user_input: str):
+    """Safely return integer."""
+    try:
+        return int(user_input)
+    except ValueError:
+        return 0
+'''
+    initial_code = """def unsafe(user_input):
+    return eval(user_input)
+"""
+    fake_llm = FakeLLM(responses=[fixed_code])
+    main_mod.llm_override = lambda: fake_llm
+
+    try:
+        response = client.post(
+            "/api/review",
+            json={"code": initial_code, "iteration_cap": 2, "pylint_threshold": 8.0},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "final_code" in data
+        assert "iterations" in data
+        assert "metrics_summary" in data
+        assert len(data["iterations"]) >= 1
+        assert fake_llm.call_count >= 1
+    finally:
+        main_mod.llm_override = None
+

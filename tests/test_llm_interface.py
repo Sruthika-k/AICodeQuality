@@ -64,3 +64,84 @@ def test_rate_limit_retry_behavior():
     result = llm.generate("Fix this code")
     assert result == "def fixed():\n    return True"
     assert llm.model.generate_content.call_count == 2
+
+
+def test_missing_api_key_raises_value_error():
+    """Verify that an empty or missing API key raises ValueError clearly."""
+    import pytest
+    with patch.dict("os.environ", {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}, clear=True):
+        with pytest.raises(ValueError, match="GEMINI_API_KEY is not set"):
+            LLMInterface(api_key=None)
+
+
+def test_successful_mocked_generation():
+    """Verify standard clean code extraction on success."""
+    llm = LLMInterface(api_key="mock_key", model_name="gemini-2.5-flash")
+    mock_resp = MagicMock()
+    mock_resp.text = "```python\ndef add(a, b):\n    return a + b\n```"
+    llm.model.generate_content = MagicMock(return_value=mock_resp)
+
+    res = llm.generate("Write an adder")
+    assert res == "def add(a, b):\n    return a + b"
+    llm.model.generate_content.assert_called_once()
+
+
+def test_malformed_and_empty_response_handling():
+    """Verify that empty responses or responses without candidates raise cleanly."""
+    import pytest
+    llm = LLMInterface(api_key="mock_key")
+    empty_resp = MagicMock()
+    empty_resp.text = ""
+    empty_resp.candidates = []
+    llm.model.generate_content = MagicMock(return_value=empty_resp)
+
+    with pytest.raises(RuntimeError, match="Gemini returned an empty response|Gemini returned no candidates"):
+        llm.generate("Some prompt")
+
+
+def test_403_permission_denied_not_retried():
+    """Verify that 403 / permission denied fails immediately without retry."""
+    import pytest
+    from google.api_core import exceptions as g_exc
+    from backend.app.llm_interface import GeminiAuthenticationError
+
+    llm = LLMInterface(api_key="mock_key", max_retries=3)
+    llm.model.generate_content = MagicMock(side_effect=g_exc.PermissionDenied("Invalid API key"))
+
+    with pytest.raises(GeminiAuthenticationError):
+        llm.generate("Prompt")
+
+    assert llm.model.generate_content.call_count == 1
+
+
+def test_429_resource_exhaustion_exhausts_retries():
+    """Verify that 429 retries up to max_retries and raises GeminiRateLimitError."""
+    import pytest
+    from google.api_core import exceptions as g_exc
+    from backend.app.llm_interface import GeminiRateLimitError
+
+    llm = LLMInterface(api_key="mock_key", max_retries=3, retry_delay_seconds=0.001)
+    llm.model.generate_content = MagicMock(side_effect=g_exc.ResourceExhausted("Quota exceeded"))
+
+    with pytest.raises(GeminiRateLimitError):
+        llm.generate("Prompt")
+
+    assert llm.model.generate_content.call_count == 3
+
+
+def test_timeout_handling_fails_immediately_without_retry():
+    """Verify that timeout/deadline exceeded fails immediately on attempt 1 without retrying."""
+    import pytest
+    from google.api_core import exceptions as g_exc
+    from backend.app.llm_interface import GeminiTimeoutError
+
+    llm = LLMInterface(api_key="mock_key", max_retries=3, retry_delay_seconds=10.0, timeout=60)
+    llm.model.generate_content = MagicMock(side_effect=g_exc.DeadlineExceeded("Deadline exceeded"))
+
+    with pytest.raises(GeminiTimeoutError):
+        llm.generate("Prompt")
+
+    # Must be called exactly once: no retries and no backoff delay
+    assert llm.model.generate_content.call_count == 1
+
+

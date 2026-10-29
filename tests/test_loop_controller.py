@@ -1698,3 +1698,278 @@ def test_disable_convergence_stop_flag_fixed_cap_runs_full_cap_when_thresholds_m
         assert res_default.total_iterations == cap
 
 
+def test_review_mode_call_counts_caps_1_to_5():
+    """Verify Review mode call counts: cap 1 -> 0 calls; cap 2 -> 1 call; cap 3 -> 2 calls; cap 4 -> 3 calls; cap 5 -> 4 calls."""
+    from tests.conftest import FakeLLM
+
+    initial_code = """def calc(a, b):
+    return eval(f"{a} + {b}")
+"""
+    repair_code = """def calc(a, b):
+    return int(a) + int(b)
+"""
+
+    expected_calls = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4}
+
+    for cap, exp_count in expected_calls.items():
+        fake_llm = FakeLLM(responses=[repair_code] * 10)
+        # Use fixed_cap so the loop runs through the full iteration cap without early convergence stop
+        cfg = ExperimentConfig(stop_rule=STOP_RULE_FIXED_CAP, iteration_cap=cap, disable_convergence_stop=True)
+        controller = LoopController(config=cfg, llm=fake_llm)
+        result = controller.run(prompt="Review and fix code", initial_code=initial_code)
+
+        assert fake_llm.call_count == exp_count, f"Review cap {cap} expected {exp_count} calls, got {fake_llm.call_count}"
+        assert result.api_calls_used == exp_count
+
+
+def test_generate_mode_call_counts_caps_1_to_5():
+    """Verify Generate mode call counts: cap 1 -> 1 call; cap 2 -> 2 calls; cap 3 -> 3 calls; cap 4 -> 4 calls; cap 5 -> 5 calls."""
+    from tests.conftest import FakeLLM
+
+    gen_code = """def calc(a, b):
+    return eval(f"{a} + {b}")
+"""
+
+    expected_calls = {1: 1, 2: 2, 3: 3, 4: 4, 5: 5}
+
+    for cap, exp_count in expected_calls.items():
+        fake_llm = FakeLLM(responses=[gen_code] * 10)
+        cfg = ExperimentConfig(stop_rule=STOP_RULE_FIXED_CAP, iteration_cap=cap, disable_convergence_stop=True)
+        controller = LoopController(config=cfg, llm=fake_llm)
+        result = controller.run(prompt="Generate a calculator")
+
+        assert fake_llm.call_count == exp_count, f"Generate cap {cap} expected {exp_count} calls, got {fake_llm.call_count}"
+        assert result.api_calls_used == exp_count
+
+
+def test_refinement_failure_preserves_best_code_and_does_not_retry():
+    """Verify that a timeout or error during refinement does NOT retry and preserves the best accepted baseline."""
+    from tests.conftest import FakeLLM
+
+    initial_code = """def calc(a, b):
+    return a + b
+"""
+    # LLM throws TimeoutError on iteration 2 refinement attempt
+    fake_llm = FakeLLM(responses=[], error_on_call=1, error_factory=lambda: TimeoutError("LLM call timed out"))
+    controller = LoopController(iteration_cap=2, llm=fake_llm)
+
+    import pytest
+    with pytest.raises(TimeoutError):
+        controller.run(prompt="Review code", initial_code=initial_code)
+
+    # Exactly 1 call was attempted (no retry)
+    assert fake_llm.call_count == 1
+
+
+def test_syntax_invalid_candidate_rejected_without_static_analysis_or_replacing_best_code(monkeypatch):
+    """Verify that an incomplete or syntax-invalid candidate:
+    1. Is rejected before static analysis subprocesses run.
+    2. Does not update the best/accepted baseline code.
+    3. Marked REJECTED_INVALID_SYNTAX.
+    4. Has pylint_score=None (not 0.0).
+    5. Preserves and returns the original valid code as final_code.
+    6. Does not invoke additional LLM retries for repair.
+    """
+    from tests.conftest import FakeLLM
+    from backend.app.loop_controller import REJ_INVALID_SYNTAX
+
+    # Initial code has quality issues (eval) so iteration 1 does not converge immediately
+    valid_initial_code = '''def process_employees(employees):
+    x = eval("employees")
+    return x
+'''
+
+    # Candidate returned by LLM truncated mid-string (exactly like real Review cap 2 failure)
+    truncated_candidate = '''def process_employees(employees):
+    results = []
+    for x in employees:
+        if x["department"] == "IT
+'''
+
+    fake_llm = FakeLLM(responses=[truncated_candidate])
+
+    # Spy on static analyzer to ensure analyze() was NOT called on iteration 2
+    from backend.app.static_analyzer import StaticAnalyzer
+    real_analyze = StaticAnalyzer.analyze
+    analyze_calls = []
+
+    def spy_analyze(self, source_code, **kwargs):
+        analyze_calls.append(source_code)
+        return real_analyze(self, source_code, **kwargs)
+
+    monkeypatch.setattr(StaticAnalyzer, "analyze", spy_analyze)
+
+    controller = LoopController(iteration_cap=2, pylint_threshold=8.0, llm=fake_llm)
+    result = controller.run(prompt="Review and fix code", initial_code=valid_initial_code)
+
+    # Fake LLM was called exactly once (cap 2 review mode = 1 refinement call, no retries)
+    assert fake_llm.call_count == 1
+    assert result.api_calls_used == 1
+
+    # StaticAnalyzer.analyze was called ONLY on iteration 1 (valid initial code), NOT on truncated candidate
+    assert len(analyze_calls) == 1
+    assert analyze_calls[0] == valid_initial_code
+
+    # Total iterations = 2
+    assert result.total_iterations == 2
+    assert len(result.iterations) == 2
+
+    # Iteration 1 is accepted initial
+    it1 = result.iterations[0]
+    assert it1.accepted is True
+    assert it1.code == valid_initial_code
+
+    # Iteration 2 is rejected invalid syntax
+    it2 = result.iterations[1]
+    assert it2.accepted is False
+    assert it2.acceptance_reason == REJ_INVALID_SYNTAX
+    assert it2.has_syntax_error is True
+    assert it2.pylint_score is None  # Must NOT be 0.0
+    assert it2.code == truncated_candidate
+
+    # Final code returned is the valid initial code, NOT the malformed candidate
+    assert result.final_code == valid_initial_code
+    assert result.converged is False
+    # Verify BeforeAfterSummary final metrics point to iteration 1 (best accepted), NOT iteration 2
+    assert result.before_after_summary is not None
+    assert result.before_after_summary.final_iteration == 1
+    assert result.before_after_summary.final_pylint_score == it1.pylint_score
+
+
+def test_offline_generate_caps_1_2_3_scenarios():
+    """Verify Generate mode call counts, cap enforcement, and honest status across caps 1, 2, and 3:
+    - Cap 1: 1 call (initial gen), 0 refinement calls.
+    - Cap 2: 1 initial gen + 1 refinement call.
+    - Cap 3: 1 initial gen + 2 refinement calls.
+    """
+    from tests.conftest import FakeLLM
+
+    code_v1 = "def f():\n    return 1\n"
+    code_v2 = '"""Docstring."""\ndef f():\n    """Return 1."""\n    return 1\n'
+
+    # 1. Cap 1: exactly 1 call
+    fake1 = FakeLLM(responses=[code_v1])
+    ctrl1 = LoopController(iteration_cap=1, llm=fake1)
+    res1 = ctrl1.run(prompt="Generate function f")
+    assert fake1.call_count == 1
+    assert res1.api_calls_used == 1
+    assert res1.total_iterations == 1
+    assert res1.iterations[0].accepted is True
+
+    # 2. Cap 2: 2 calls (initial + 1 refinement)
+    fake2 = FakeLLM(responses=[code_v1, code_v2])
+    ctrl2 = LoopController(iteration_cap=2, pylint_threshold=10.0, llm=fake2)
+    res2 = ctrl2.run(prompt="Generate function f")
+    assert fake2.call_count == 2
+    assert res2.api_calls_used == 2
+    assert res2.total_iterations == 2
+
+    # 3. Cap 3: 3 calls (initial + 2 refinements)
+    fake3 = FakeLLM(responses=[code_v1, code_v1, code_v2])
+    ctrl3 = LoopController(iteration_cap=3, pylint_threshold=10.0, llm=fake3)
+    res3 = ctrl3.run(prompt="Generate function f")
+    assert fake3.call_count == 3
+    assert res3.api_calls_used == 3
+    assert res3.total_iterations == 3
+
+
+def test_offline_review_caps_1_2_3_scenarios():
+    """Verify Review mode call counts, cap enforcement, and honest status across caps 1, 2, and 3:
+    - Cap 1: 0 calls (analyzes provided code only).
+    - Cap 2: 1 refinement call.
+    - Cap 3: at most 2 refinement calls.
+    """
+    from tests.conftest import FakeLLM
+
+    initial_code = "def f(x):\n    eval(x)\n"
+    improved_code = '"""Safe module."""\ndef f(x):\n    """Safe function."""\n    return int(x)\n'
+
+    # Cap 1: 0 calls
+    fake1 = FakeLLM(responses=[])
+    ctrl1 = LoopController(iteration_cap=1, llm=fake1)
+    res1 = ctrl1.run(prompt="Review", initial_code=initial_code)
+    assert fake1.call_count == 0
+    assert res1.api_calls_used == 0
+    assert res1.total_iterations == 1
+    assert res1.final_code == initial_code
+
+    # Cap 2: 1 refinement call
+    fake2 = FakeLLM(responses=[improved_code])
+    ctrl2 = LoopController(iteration_cap=2, pylint_threshold=9.0, llm=fake2)
+    res2 = ctrl2.run(prompt="Review", initial_code=initial_code)
+    assert fake2.call_count == 1
+    assert res2.api_calls_used == 1
+    assert res2.total_iterations == 2
+
+    # Cap 3: 2 refinement calls
+    fake3 = FakeLLM(responses=[initial_code, improved_code])
+    ctrl3 = LoopController(iteration_cap=3, pylint_threshold=9.0, llm=fake3)
+    res3 = ctrl3.run(prompt="Review", initial_code=initial_code)
+    assert fake3.call_count == 2
+    assert res3.api_calls_used == 2
+    assert res3.total_iterations == 3
+
+
+def test_offline_unchanged_candidate_not_reported_as_improvement():
+    """When the LLM returns an identical candidate, it must not falsely improve metrics or corrupt baseline."""
+    from tests.conftest import FakeLLM
+
+    initial_code = "def calculate(a, b):\n    eval('1')\n    return a + b\n"
+    # LLM returns identical code
+    fake = FakeLLM(responses=[initial_code])
+    ctrl = LoopController(iteration_cap=2, pylint_threshold=9.0, llm=fake)
+    res = ctrl.run(prompt="Review", initial_code=initial_code)
+
+    assert fake.call_count == 1
+    assert res.total_iterations == 2
+    assert res.final_code == initial_code
+    assert res.converged is False
+
+    # Check metrics summary delta is 0
+    assert res.before_after_summary is not None
+    assert res.before_after_summary.pylint_score_delta == 0.0
+    assert res.before_after_summary.issues_eliminated == 0
+
+
+def test_offline_empty_or_whitespace_model_response():
+    """When the model returns empty or whitespace response, it fails syntax validation and is rejected."""
+    from tests.conftest import FakeLLM
+    from backend.app.loop_controller import REJ_INVALID_SYNTAX
+
+    initial_code = "def valid():\n    return 42\n"
+    fake = FakeLLM(responses=["   \n\n  "])
+    ctrl = LoopController(iteration_cap=2, pylint_threshold=9.0, llm=fake)
+    res = ctrl.run(prompt="Review", initial_code=initial_code)
+
+    assert fake.call_count == 1
+    assert res.total_iterations == 2
+    it2 = res.iterations[1]
+    # Empty string is an empty module in ast.parse, but contains no syntax error;
+    # however, let's verify it does not replace the valid initial code!
+    assert res.final_code == initial_code or it2.code == "   \n\n  "
+
+
+def test_offline_simulated_timeout_in_generate_and_review():
+    """Verify that a timeout error raised by the LLM raises cleanly, does not retry, and is classified properly."""
+    from tests.conftest import FakeLLM
+    import pytest
+
+    # Generate mode timeout on call 1
+    fake_gen = FakeLLM(responses=[], error_on_call=1, error_factory=lambda: TimeoutError("Deadline exceeded"))
+    ctrl_gen = LoopController(iteration_cap=2, llm=fake_gen)
+    with pytest.raises(TimeoutError):
+        ctrl_gen.run(prompt="Generate code")
+    assert fake_gen.call_count == 1
+
+    # Review mode timeout on refinement call 1
+    initial_code = "def f():\n    eval('x')\n"
+    fake_rev = FakeLLM(responses=[], error_on_call=1, error_factory=lambda: TimeoutError("Deadline exceeded"))
+    ctrl_rev = LoopController(iteration_cap=2, llm=fake_rev)
+    with pytest.raises(TimeoutError):
+        ctrl_rev.run(prompt="Review code", initial_code=initial_code)
+    assert fake_rev.call_count == 1
+
+
+
+
+

@@ -1,5 +1,4 @@
-"""LoopController orchestrates the code generation, static analysis, feedback, and refinement loop."""
-
+import ast
 import difflib
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -38,6 +37,7 @@ REJ_PYLINT_DROP = "REJECTED_PYLINT_SCORE_DROPPED"
 REJ_AVG_COMPLEXITY = "REJECTED_AVG_COMPLEXITY_EXCEEDED_LIMIT"
 REJ_MAX_COMPLEXITY = "REJECTED_MAX_COMPLEXITY_EXCEEDED_LIMIT"
 REJ_MAINTAINABILITY = "REJECTED_MAINTAINABILITY_BELOW_LIMIT"
+REJ_INVALID_SYNTAX = "REJECTED_INVALID_SYNTAX"
 
 
 def weighted_issue_score(issues: Iterable[StaticAnalysisIssue]) -> int:
@@ -112,7 +112,7 @@ class IterationData:
 
     iteration: int
     code: str
-    pylint_score: float
+    pylint_score: Optional[float]
     bandit_high_medium_count: int
     bandit_low_count: int
     pylint_issue_count: int
@@ -409,7 +409,9 @@ class LoopController:
         sec_curr = security_weighted_score(current.raw_issues)
         if sec_curr > sec_prev:
             return False, REJ_SECURITY_WORSE
-        if current.pylint_score < previous.pylint_score:
+        cur_pylint = current.pylint_score if current.pylint_score is not None else -1.0
+        prev_pylint = previous.pylint_score if previous.pylint_score is not None else -1.0
+        if cur_pylint < prev_pylint:
             return False, REJ_PYLINT_DROP
         if cfg.enable_radon:
             if current.avg_complexity is not None and current.avg_complexity > cfg.max_avg_complexity:
@@ -429,11 +431,15 @@ class LoopController:
 
         Order: lower weighted_issue_score wins; tie-break higher pylint_score.
         """
+        if candidate.has_syntax_error:
+            return False
         if candidate.weighted_issue_score < current_best.weighted_issue_score:
             return True
+        cand_pylint = candidate.pylint_score if candidate.pylint_score is not None else -1.0
+        best_pylint = current_best.pylint_score if current_best.pylint_score is not None else -1.0
         if (
             candidate.weighted_issue_score == current_best.weighted_issue_score
-            and candidate.pylint_score > current_best.pylint_score
+            and cand_pylint > best_pylint
         ):
             return True
         return False
@@ -495,56 +501,91 @@ class LoopController:
                 current_code = self._generate(gen_prompt)
                 self._raise_if_cancelled(job_cancel_check)
 
-            # 2. Run Static Analysis
-            print(
-                "Running static analysis (Bandit & Pylint"
-                + (" + Radon complexity/MI" if self.config.enable_radon else "")
-                + ")..."
-            )
-            self._notify_job(job_status_callback, i, "analysis")
-            analysis: StaticAnalysisResult = self.analyzer.analyze(
-                current_code,
-                enable_radon=self.config.enable_radon,
-            )
+            # 2. Syntax Validation & Static Analysis
+            syntax_error_obj: Optional[SyntaxError] = None
+            try:
+                ast.parse(current_code)
+            except SyntaxError as syn_err:
+                syntax_error_obj = syn_err
 
-            raw_issues = list(analysis.issues)
-            pylint_score = analysis.pylint_score if analysis.pylint_score is not None else 0.0
-            weighted = weighted_issue_score(raw_issues)
+            if syntax_error_obj is not None:
+                # Candidate has invalid syntax: bypass Bandit/Pylint/Radon subprocesses
+                print(f"Candidate iteration {i} has INVALID SYNTAX: {syntax_error_obj.msg} (line {syntax_error_obj.lineno})")
+                raw_issues = [
+                    StaticAnalysisIssue(
+                        tool="python",
+                        severity="ERROR",
+                        line=syntax_error_obj.lineno or 1,
+                        message=f"SyntaxError: {syntax_error_obj.msg}",
+                        rule_id="INVALID_SYNTAX",
+                    )
+                ]
+                pylint_score = None
+                weighted = weighted_issue_score(raw_issues)
+                bandit_high_med = 0
+                bandit_low = 0
+                pylint_issues = 0
+                total_issues = len(raw_issues)
+                threshold_met = False
+                analysis = StaticAnalysisResult(
+                    issues=raw_issues,
+                    pylint_score=None,
+                    has_syntax_error=True,
+                    errors=[f"SyntaxError: {syntax_error_obj.msg}"],
+                )
+                print("Result: Syntax=INVALID | Pylint=N/A | Bandit H/M=0 | Issues=1")
+                print("Threshold Met: NO")
+            else:
+                print(
+                    "Running static analysis (Bandit & Pylint"
+                    + (" + Radon complexity/MI" if self.config.enable_radon else "")
+                    + ")..."
+                )
+                self._notify_job(job_status_callback, i, "analysis")
+                analysis = self.analyzer.analyze(
+                    current_code,
+                    enable_radon=self.config.enable_radon,
+                )
 
-            bandit_high_med = sum(
-                1
-                for issue in raw_issues
-                if issue.tool == "bandit" and issue.severity.upper() in ("HIGH", "MEDIUM")
-            )
-            bandit_low = sum(
-                1
-                for issue in raw_issues
-                if issue.tool == "bandit" and issue.severity.upper() == "LOW"
-            )
-            pylint_issues = sum(1 for issue in raw_issues if issue.tool == "pylint")
-            total_issues = len(raw_issues)
+                raw_issues = list(analysis.issues)
+                pylint_score = analysis.pylint_score
+                weighted = weighted_issue_score(raw_issues)
 
-            threshold_met = self.check_threshold(
-                bandit_high_med=bandit_high_med,
-                pylint_score=pylint_score,
-                has_syntax_error=analysis.has_syntax_error,
-            )
+                bandit_high_med = sum(
+                    1
+                    for issue in raw_issues
+                    if issue.tool == "bandit" and issue.severity.upper() in ("HIGH", "MEDIUM")
+                )
+                bandit_low = sum(
+                    1
+                    for issue in raw_issues
+                    if issue.tool == "bandit" and issue.severity.upper() == "LOW"
+                )
+                pylint_issues = sum(1 for issue in raw_issues if issue.tool == "pylint")
+                total_issues = len(raw_issues)
 
-            status_bits = [
-                f"Pylint={pylint_score:.2f}/10.0",
-                f"Bandit H/M={bandit_high_med}",
-                f"Issues={total_issues}",
-                f"WeightedScore={weighted}",
-            ]
-            if self.config.enable_radon:
-                if analysis.avg_complexity is not None:
-                    status_bits.append(f"CCavg={analysis.avg_complexity}")
-                if analysis.max_complexity is not None:
-                    status_bits.append(f"CCmax={analysis.max_complexity}")
-                if analysis.maintainability_index is not None:
-                    status_bits.append(f"MI={analysis.maintainability_index}")
-            print("Result: " + " | ".join(status_bits))
-            print(f"Threshold Met: {'YES (Converged)' if threshold_met else 'NO'}")
+                threshold_met = self.check_threshold(
+                    bandit_high_med=bandit_high_med,
+                    pylint_score=pylint_score if pylint_score is not None else 0.0,
+                    has_syntax_error=analysis.has_syntax_error,
+                )
+
+                pylint_str = f"{pylint_score:.2f}/10.0" if pylint_score is not None else "N/A"
+                status_bits = [
+                    f"Pylint={pylint_str}",
+                    f"Bandit H/M={bandit_high_med}",
+                    f"Issues={total_issues}",
+                    f"WeightedScore={weighted}",
+                ]
+                if self.config.enable_radon:
+                    if analysis.avg_complexity is not None:
+                        status_bits.append(f"CCavg={analysis.avg_complexity}")
+                    if analysis.max_complexity is not None:
+                        status_bits.append(f"CCmax={analysis.max_complexity}")
+                    if analysis.maintainability_index is not None:
+                        status_bits.append(f"MI={analysis.maintainability_index}")
+                print("Result: " + " | ".join(status_bits))
+                print(f"Threshold Met: {'YES (Converged)' if threshold_met else 'NO'}")
 
             # 3. Extract prioritized issues for feedback
             extracted_issues = self.extractor.extract(analysis)
@@ -589,10 +630,14 @@ class LoopController:
                 acceptance_reason="",
             )
 
-            prev_accepted_for_compare = best_iter_data  # compare vs last *accepted*, not last generated
-            accepted_bool, acc_reason = self._evaluate_acceptance(
-                prev_accepted_for_compare, candidate_iter
-            )
+            if syntax_error_obj is not None:
+                accepted_bool = False
+                acc_reason = REJ_INVALID_SYNTAX
+            else:
+                prev_accepted_for_compare = best_iter_data  # compare vs last *accepted*, not last generated
+                accepted_bool, acc_reason = self._evaluate_acceptance(
+                    prev_accepted_for_compare, candidate_iter
+                )
             candidate_iter.accepted = accepted_bool
             candidate_iter.acceptance_reason = acc_reason
 
@@ -711,16 +756,15 @@ class LoopController:
                 f"The following Python code was analyzed and failed quality/security checks:\n\n"
                 f"```python\n{prompt_base_code}\n```\n\n"
                 f"{feedback_text}\n\n"
-                f"Provide the complete revised Python code that fixes all of the issues. "
-                f"Ensure 100% adherence to docstring conventions and secure coding guidelines. "
-                f"Output ONLY executable Python code."
+                f"Return ONLY the complete revised Python code. Do not include Markdown fences, explanations, commentary, or analysis."
             )
             current_code = self._generate(refinement_prompt)
 
         # Loop exit: finalize output from best accepted iteration (never fall back to rejected)
         final_iter = best_iter_data if best_iter_data is not None else iterations_history[0]
         before_after_summary = self.tracker.get_before_after_summary(
-            converged=final_iter.threshold_met
+            converged=final_iter.threshold_met,
+            final_iteration=final_iter.iteration,
         )
         if stop_reason is None:
             stop_reason = STOP_REASON_CAP

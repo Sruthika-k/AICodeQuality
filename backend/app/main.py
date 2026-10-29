@@ -18,6 +18,13 @@ from backend.app.demo_llm import DemoLLM
 from backend.app.loop_controller import LoopController, LoopResult
 from backend.app.report_generator import generate_markdown_report
 from backend.app.exceptions import JobCancelled, QuotaExceeded
+from backend.app.llm_interface import (
+    GeminiAuthenticationError,
+    GeminiInvalidRequestError,
+    GeminiNetworkError,
+    GeminiRateLimitError,
+    GeminiTimeoutError,
+)
 
 # Configure secure logging
 log_dir = Path(__file__).parent.parent / "logs"
@@ -109,13 +116,15 @@ class IssueModel(BaseModel):
 class IterationModel(BaseModel):
     iteration: int
     code: str
-    pylint_score: float
+    pylint_score: Optional[float] = None
     bandit_high_medium_count: int
     bandit_low_count: int
     pylint_issue_count: int
     total_issues_count: int
     has_syntax_error: bool
     threshold_met: bool
+    accepted: bool = True
+    acceptance_reason: str = "ACCEPTED_INITIAL"
     feedback_text: Optional[str] = None
     diff: Optional[str] = None
     diff_lines: List[Dict[str, Any]] = Field(default_factory=list)
@@ -147,7 +156,7 @@ class CodeOptimizationResponse(BaseModel):
     final_code: str
     converged: bool
     total_iterations: int
-    final_pylint_score: float
+    final_pylint_score: Optional[float] = None
     final_bandit_high_medium: int
     status: str
     iterations: List[IterationModel]
@@ -218,13 +227,27 @@ def _resolve_llm(demo: bool = False):
 
 
 def _classify_job_error(exc: BaseException) -> Dict[str, Any]:
-    if isinstance(exc, QuotaExceeded):
+    if isinstance(exc, (QuotaExceeded, GeminiRateLimitError)):
         return {
             "code": "quota_exhausted",
             "message": "Gemini quota is exhausted. Wait and retry, or try demo mode.",
             "retry_after": getattr(exc, "retry_after", 0) or 60,
         }
+    if isinstance(exc, (GeminiAuthenticationError,)):
+        return {
+            "code": "permission_denied",
+            "message": "Gemini access/permission problem (403): Invalid API key or permission denied.",
+        }
+    if isinstance(exc, (GeminiTimeoutError, TimeoutError)):
+        return {"code": "timeout", "message": "Gemini request timed out."}
+    if isinstance(exc, (GeminiNetworkError,)):
+        return {"code": "network_error", "message": "Gemini connection failure: service unavailable."}
+    if isinstance(exc, (GeminiInvalidRequestError,)):
+        return {"code": "invalid_request", "message": str(exc)}
+
     text = str(exc).lower()
+    if "permission denied" in text or "unauthenticated" in text or "403" in text:
+        return {"code": "permission_denied", "message": "Gemini access/permission problem (403)."}
     if isinstance(exc, TimeoutError) or "timed out" in text or "timeout" in text:
         return {"code": "timeout", "message": "The refinement run timed out."}
     if "rate limit" in text or "resourceexhausted" in text or "quota" in text or "429" in text:
@@ -233,6 +256,8 @@ def _classify_job_error(exc: BaseException) -> Dict[str, Any]:
             "message": "Gemini quota is exhausted. Wait and retry, or try demo mode.",
             "retry_after": 60,
         }
+    if "connection" in text or "network" in text or "unavailable" in text:
+        return {"code": "network_error", "message": "Gemini connection failure."}
     return {"code": "internal_error", "message": type(exc).__name__}
 
 
@@ -296,6 +321,8 @@ def run_job_in_thread(job_id: str, request: BackgroundRunRequest):
                     total_issues_count=it.total_issues_count,
                     has_syntax_error=it.has_syntax_error,
                     threshold_met=it.threshold_met,
+                    accepted=it.accepted,
+                    acceptance_reason=it.acceptance_reason,
                     feedback_text=it.feedback_text,
                     diff=it.diff,
                     diff_lines=it.diff_lines,
@@ -395,7 +422,8 @@ def optimize_code(request: CodePromptRequest) -> CodeOptimizationResponse:
         controller = LoopController(
             iteration_cap=request.iteration_cap,
             pylint_threshold=request.pylint_threshold,
-            max_bandit_high_med=0
+            max_bandit_high_med=0,
+            llm=_resolve_llm(),
         )
         result: LoopResult = controller.run(
             prompt=request.prompt.strip(),
@@ -417,6 +445,8 @@ def optimize_code(request: CodePromptRequest) -> CodeOptimizationResponse:
                     total_issues_count=it.total_issues_count,
                     has_syntax_error=it.has_syntax_error,
                     threshold_met=it.threshold_met,
+                    accepted=it.accepted,
+                    acceptance_reason=it.acceptance_reason,
                     feedback_text=it.feedback_text,
                     diff=it.diff,
                     diff_lines=it.diff_lines,
@@ -471,10 +501,19 @@ def optimize_code(request: CodePromptRequest) -> CodeOptimizationResponse:
             pylint_threshold=request.pylint_threshold,
         )
 
-    except ValueError as exc:
+    except GeminiAuthenticationError as exc:
+        logger.error(f"Authentication/permission error in optimize: {str(exc)}")
+        raise HTTPException(status_code=403, detail="Gemini access/permission problem (403): Invalid API key or permission denied.") from exc
+    except (GeminiRateLimitError, QuotaExceeded) as exc:
+        logger.error(f"Rate limit error in optimize: {str(exc)}")
+        raise HTTPException(status_code=429, detail="Gemini quota/rate-limit problem (429): Quota exhausted.") from exc
+    except (GeminiTimeoutError, TimeoutError) as exc:
+        logger.error(f"Timeout in optimize: {str(exc)}")
+        raise HTTPException(status_code=504, detail="Gemini request timed out.") from exc
+    except (GeminiInvalidRequestError, ValueError) as exc:
         logger.error(f"Validation error in optimize: {str(exc)}")
         raise HTTPException(status_code=400, detail=f"Invalid input: {str(exc)}") from exc
-    except RuntimeError as exc:
+    except (GeminiNetworkError, RuntimeError) as exc:
         logger.error(f"Runtime error in optimize: {str(exc)}")
         raise HTTPException(status_code=503, detail=f"Service error: {str(exc)}") from exc
     except Exception as exc:
@@ -502,7 +541,8 @@ def review_code(request: CodeReviewRequest) -> CodeOptimizationResponse:
         controller = LoopController(
             iteration_cap=request.iteration_cap,
             pylint_threshold=request.pylint_threshold,
-            max_bandit_high_med=0
+            max_bandit_high_med=0,
+            llm=_resolve_llm(),
         )
         result: LoopResult = controller.run(
             prompt="Review and improve the provided Python code while preserving its behavior.",
@@ -524,6 +564,8 @@ def review_code(request: CodeReviewRequest) -> CodeOptimizationResponse:
                     total_issues_count=it.total_issues_count,
                     has_syntax_error=it.has_syntax_error,
                     threshold_met=it.threshold_met,
+                    accepted=it.accepted,
+                    acceptance_reason=it.acceptance_reason,
                     feedback_text=it.feedback_text,
                     diff=it.diff,
                     diff_lines=it.diff_lines,
@@ -578,10 +620,19 @@ def review_code(request: CodeReviewRequest) -> CodeOptimizationResponse:
             pylint_threshold=request.pylint_threshold,
         )
 
-    except ValueError as exc:
+    except GeminiAuthenticationError as exc:
+        logger.error(f"Authentication/permission error in review: {str(exc)}")
+        raise HTTPException(status_code=403, detail="Gemini access/permission problem (403): Invalid API key or permission denied.") from exc
+    except (GeminiRateLimitError, QuotaExceeded) as exc:
+        logger.error(f"Rate limit error in review: {str(exc)}")
+        raise HTTPException(status_code=429, detail="Gemini quota/rate-limit problem (429): Quota exhausted.") from exc
+    except (GeminiTimeoutError, TimeoutError) as exc:
+        logger.error(f"Timeout in review: {str(exc)}")
+        raise HTTPException(status_code=504, detail="Gemini request timed out.") from exc
+    except (GeminiInvalidRequestError, ValueError) as exc:
         logger.error(f"Validation error in review: {str(exc)}")
         raise HTTPException(status_code=400, detail=f"Invalid input: {str(exc)}") from exc
-    except RuntimeError as exc:
+    except (GeminiNetworkError, RuntimeError) as exc:
         logger.error(f"Runtime error in review: {str(exc)}")
         raise HTTPException(status_code=503, detail=f"Service error: {str(exc)}") from exc
     except Exception as exc:

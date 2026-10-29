@@ -1,0 +1,160 @@
+--- original
++++ refined
+@@ -1,72 +1,93 @@
++"""Module for processing employee expense reports safely and cleanly."""
++
+ import csv
+-import os
+-import subprocess
++from typing import Any, Dict, List, Optional
+ 
+-def process_expenses(csv_file_path, dept_filter, cat_filter, max_amount=1000.0, custom_rule=None):
+-    records = []
+-    tot = 0
+-    cnt = 0
+-    d = {}
+-    f = open(csv_file_path, 'r')
+-    r = csv.reader(f)
+-    header = next(r)
+-    for row in r:
+-        try:
+-            emp_id = row[0]
+-            name = row[1]
+-            department = row[2]
+-            category = row[3]
+-            amount = float(row[4])
+-            date = row[5]
+-            if dept_filter != '':
+-                if department != dept_filter:
+-                    continue
+-            else:
+-                pass
+-            if cat_filter != '':
+-                if category != cat_filter:
+-                    continue
+-            else:
+-                pass
+-            if amount > max_amount:
++
++def parse_expense_records(csv_file_path: str) -> List[Dict[str, Any]]:
++    """Parse and validate expense records from a CSV file."""
++    records: List[Dict[str, Any]] = []
++    with open(csv_file_path, "r", encoding="utf-8") as file:
++        reader = csv.DictReader(file)
++        for row in reader:
++            try:
++                records.append({
++                    "id": row["employee_id"],
++                    "name": row["name"],
++                    "dept": row["department"],
++                    "category": row["category"],
++                    "amount": float(row["amount"]),
++                    "date": row["date"],
++                })
++            except (KeyError, ValueError):
+                 continue
+-            if custom_rule is not None:
+-                if not eval(custom_rule):
+-                    continue
+-            records.append({'id': emp_id, 'name': name, 'dept': department, 'cat': category, 'amt': amount, 'dt': date})
+-            tot = tot + amount
+-            cnt = cnt + 1
+-            if department not in d:
+-                d[department] = 0
+-            d[department] = d[department] + amount
+-        except Exception:
+-            pass
+-    f.close()
++    return records
+ 
+-    avg = 0
+-    if cnt > 0:
+-        avg = tot / cnt
+-    else:
+-        avg = 0
+ 
+-    print('Processed ' + str(cnt) + ' expenses totaling ' + str(tot))
+-    report_lines = []
+-    report_lines.append('=== EXPENSE SUMMARY REPORT ===')
+-    report_lines.append('Total Amount: ' + str(tot))
+-    report_lines.append('Total Count: ' + str(cnt))
+-    report_lines.append('Average Expense: ' + str(avg))
+-    report_lines.append('Breakdown by Department:')
+-    for k in d:
+-        report_lines.append(' - ' + str(k) + ': ' + str(d[k]))
++def filter_expenses(
++    records: List[Dict[str, Any]],
++    dept_filter: Optional[str] = None,
++    cat_filter: Optional[str] = None,
++    max_amount: float = 1000.0,
++) -> List[Dict[str, Any]]:
++    """Filter expense records by department, category, and maximum amount."""
++    filtered = []
++    for rec in records:
++        if dept_filter and rec["dept"] != dept_filter:
++            continue
++        if cat_filter and rec["category"] != cat_filter:
++            continue
++        if rec["amount"] > max_amount:
++            continue
++        filtered.append(rec)
++    return filtered
+ 
+-    out_file = 'expense_summary.txt'
+-    f2 = open(out_file, 'w')
+-    for line in report_lines:
+-        f2.write(line + '\n')
+-    f2.close()
+ 
+-    cmd = 'echo Expense report generated: ' + out_file
+-    os.system(cmd)
+-    subprocess.run(['echo', 'Done'], shell=True)
++def summarize_expenses(records: List[Dict[str, Any]]) -> Dict[str, Any]:
++    """Calculate expense metrics and department breakdowns."""
++    total = sum(rec["amount"] for rec in records)
++    count = len(records)
++    average = (total / count) if count > 0 else 0.0
+ 
+-    return {'total': tot, 'count': cnt, 'average': avg, 'by_dept': d}
++    by_dept: Dict[str, float] = {}
++    for rec in records:
++        dept = rec["dept"]
++        by_dept[dept] = by_dept.get(dept, 0.0) + rec["amount"]
++
++    return {
++        "total": round(total, 2),
++        "count": count,
++        "average": round(average, 2),
++        "by_dept": by_dept,
++    }
++
++
++def write_summary_report(summary: Dict[str, Any], output_path: str) -> None:
++    """Write human-readable summary report to disk."""
++    lines = [
++        "=== EXPENSE SUMMARY REPORT ===",
++        f"Total Amount: {summary['total']:.2f}",
++        f"Total Count: {summary['count']}",
++        f"Average Expense: {summary['average']:.2f}",
++        "Breakdown by Department:",
++    ]
++    for dept, amount in summary["by_dept"].items():
++        lines.append(f" - {dept}: {amount:.2f}")
++
++    with open(output_path, "w", encoding="utf-8") as file:
++        file.write("\n".join(lines) + "\n")
++
++
++def process_expenses(
++    csv_file_path: str,
++    dept_filter: Optional[str] = None,
++    cat_filter: Optional[str] = None,
++    max_amount: float = 1000.0,
++    output_path: str = "expense_summary.txt",
++) -> Dict[str, Any]:
++    """Coordinate end-to-end processing and report generation."""
++    records = parse_expense_records(csv_file_path)
++    matching = filter_expenses(records, dept_filter, cat_filter, max_amount)
++    summary = summarize_expenses(matching)
++    write_summary_report(summary, output_path)
++    return summary

@@ -24,27 +24,33 @@ export default function Header({
             <span className="badge-label">Backend</span>
             <span className="badge-status">
               {backendStatus === "connected"
-                ? "OK"
-                : backendStatus === "offline"
-                  ? "Offline"
-                  : backendStatus === "demo"
-                    ? "Playback"
-                    : "Idle"}
+                ? "Connected"
+                : backendStatus === "processing"
+                  ? "Processing"
+                  : backendStatus === "checking"
+                    ? "Checking..."
+                    : backendStatus === "offline"
+                      ? "Offline"
+                      : backendStatus === "demo"
+                        ? "Playback"
+                        : "Idle"}
             </span>
           </div>
           <div className={`status-badge gemini ${geminiStatus}`}>
             <span className="badge-dot"></span>
             <span className="badge-label">Gemini</span>
             <span className="badge-status">
-              {geminiStatus === "ok"
-                ? "OK"
-                : geminiStatus === "quota"
-                  ? "Quota"
-                  : geminiStatus === "demo"
-                    ? "Not called"
-                    : geminiStatus === "unknown"
-                      ? "Idle"
-                      : "Error"}
+              {geminiStatus === "running"
+                ? "Running"
+                : geminiStatus === "ready" || geminiStatus === "ok"
+                  ? "Ready"
+                  : geminiStatus === "quota"
+                    ? "Quota"
+                    : geminiStatus === "demo"
+                      ? "Not called"
+                      : geminiStatus === "unknown"
+                        ? "Idle"
+                        : "Error"}
             </span>
           </div>
         </div>
